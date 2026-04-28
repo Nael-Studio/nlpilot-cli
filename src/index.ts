@@ -1,0 +1,150 @@
+#!/usr/bin/env bun
+import { Command, Option } from "commander";
+import kleur from "kleur";
+import pkg from "../package.json" with { type: "json" };
+import { loginCommand } from "./commands/login.ts";
+import { logoutCommand } from "./commands/logout.ts";
+import { startRepl } from "./commands/repl.ts";
+import { helpCommand } from "./commands/help.ts";
+import { modelsCommand } from "./commands/models.ts";
+import { runOneShot, type OutputFormat } from "./commands/oneshot.ts";
+import { initCommand } from "./commands/init.ts";
+import { mcpCommand } from "./commands/mcp.ts";
+
+interface RootOptions {
+  model?: string;
+  prompt?: string;
+  silent?: boolean;
+  outputFormat?: OutputFormat;
+  allowAllTools?: boolean;
+  allowAll?: boolean;
+  allowTool?: string[];
+  denyTool?: string[];
+  continue?: boolean;
+}
+
+function collect(value: string, prev: string[] = []): string[] {
+  return prev.concat(value.split(",").map((v) => v.trim()).filter(Boolean));
+}
+
+const program = new Command();
+
+program
+  .name("nlpilot")
+  .description("A CLI clone of GitHub Copilot CLI powered by the Vercel AI SDK")
+  .version(pkg.version, "-v, --version", "Print version")
+  .option("-m, --model <model>", "Override the default model for this run")
+  .option("-p, --prompt <prompt>", "Run a single prompt non-interactively, then exit")
+  .option("-s, --silent", "Output only the agent response (no banners or tool logs)")
+  .addOption(
+    new Option(
+      "--output-format <format>",
+      "Output format for non-interactive mode",
+    )
+      .choices(["text", "json"])
+      .default("text"),
+  )
+  .option("--allow-all-tools", "Skip approval prompts (autopilot mode)")
+  .option("--allow-all", "Alias for --allow-all-tools")
+  .option(
+    "--allow-tool <tool>",
+    "Always allow the named tool (repeatable, comma-separated)",
+    collect,
+    [] as string[],
+  )
+  .option(
+    "--deny-tool <tool>",
+    "Deny the named tool (repeatable, comma-separated)",
+    collect,
+    [] as string[],
+  )
+  .option("--continue", "Resume the most recent session in this cwd")
+  .action(async (opts: RootOptions) => {
+    const allowAll = Boolean(opts.allowAllTools ?? opts.allowAll);
+    const allow = opts.allowTool ?? [];
+    const deny = opts.denyTool ?? [];
+
+    if (opts.prompt) {
+      const code = await runOneShot({
+        prompt: opts.prompt,
+        model: opts.model,
+        silent: opts.silent,
+        outputFormat: opts.outputFormat ?? "text",
+        allowAll,
+        allow,
+        deny,
+        continueSession: opts.continue,
+      });
+      process.exit(code);
+    }
+
+    await startRepl({
+      model: opts.model,
+      continueSession: opts.continue,
+      allowAll,
+      allow,
+      deny,
+    });
+  });
+
+program
+  .command("login")
+  .description("Prompt for an API key and store it under ~/.nlpilot/credentials")
+  .action(async () => {
+    await loginCommand();
+  });
+
+program
+  .command("logout")
+  .description("Clear stored API key")
+  .action(async () => {
+    await logoutCommand();
+  });
+
+program
+  .command("version")
+  .description("Print version info")
+  .action(() => {
+    console.log(`nlpilot v${pkg.version}`);
+  });
+
+program
+  .command("help [topic]")
+  .description("Display help; topics: config, commands, environment, permissions")
+  .action((topic?: string) => {
+    helpCommand(topic);
+  });
+
+program
+  .command("models [provider]")
+  .description("List known models. Optional provider: openai | anthropic | google")
+  .action(async (provider?: string) => {
+    await modelsCommand(provider);
+  });
+
+program
+  .command("init")
+  .description("Analyze the repo and write .nlpilot/instructions.md")
+  .action(async () => {
+    await initCommand();
+  });
+
+program
+  .command("mcp [action] [name]")
+  .description("Manage MCP servers: list | get <name> | add [name] | remove <name>")
+  .action(async (action?: string, name?: string) => {
+    await mcpCommand(action, name);
+  });
+
+function formatError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "object" && err !== null) return JSON.stringify(err);
+  return String(err);
+}
+
+try {
+  await program.parseAsync(process.argv);
+} catch (err: unknown) {
+  console.error(kleur.red("✗"), formatError(err));
+  process.exit(1);
+}

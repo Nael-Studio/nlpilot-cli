@@ -1,0 +1,29 @@
+{
+  "name": "nlpilot",
+  "version": "0.1.0",
+  "description": "A CLI clone of GitHub Copilot CLI powered by the Vercel AI SDK",
+  "type": "module",
+  "bin": {
+    "nlpilot": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun run src/index.ts",
+    "build": "bun build src/index.ts --target=bun --outfile=dist/nlpilot.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@ai-sdk/gateway": "^3.0.104",
+    "@inquirer/prompts": "^8.4.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ai": "^6.0.168",
+    "commander": "^14.0.3",
+    "kleur": "^4.1.5",
+    "zod": "^4.3.6"
+  }
+}

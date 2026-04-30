@@ -34,6 +34,8 @@ export interface Session {
   agents: CustomAgent[];
   skills: Skill[];
   hooks: HooksConfig;
+  enableReasoningSummaries?: boolean;
+  additionalMcpConfig?: string;
 }
 
 export interface LoadedInstruction {

@@ -18,6 +18,9 @@ interface RootOptions {
   outputFormat?: OutputFormat;
   allowAllTools?: boolean;
   allowAll?: boolean;
+  noAskUser?: boolean;
+  enableReasoningSummaries?: boolean;
+  additionalMcpConfig?: string;
   allowTool?: string[];
   denyTool?: string[];
   continue?: boolean;
@@ -46,6 +49,9 @@ program
   )
   .option("--allow-all-tools", "Skip approval prompts (autopilot mode)")
   .option("--allow-all", "Alias for --allow-all-tools")
+  .option("--no-ask-user", "Do not ask for user confirmation (autopilot mode)")
+  .option("--enable-reasoning-summaries", "Show reasoning/thinking summaries from the model")
+  .option("--additional-mcp-config <path>", "Load additional MCP servers from a file")
   .option(
     "--allow-tool <tool>",
     "Always allow the named tool (repeatable, comma-separated)",
@@ -60,7 +66,7 @@ program
   )
   .option("--continue", "Resume the most recent session in this cwd")
   .action(async (opts: RootOptions) => {
-    const allowAll = Boolean(opts.allowAllTools ?? opts.allowAll);
+    const allowAll = Boolean(opts.allowAllTools ?? opts.allowAll ?? opts.noAskUser);
     const allow = opts.allowTool ?? [];
     const deny = opts.denyTool ?? [];
 
@@ -74,6 +80,8 @@ program
         allow,
         deny,
         continueSession: opts.continue,
+        enableReasoningSummaries: opts.enableReasoningSummaries,
+        additionalMcpConfig: opts.additionalMcpConfig,
       });
       process.exit(code);
     }

@@ -17,7 +17,7 @@ import {
   newSessionId,
   saveSession,
 } from "../persistence.ts";
-import { loadEffectiveMcpConfig } from "../mcp.ts";
+import { loadEffectiveMcpConfig, mergeAdditionalMcpConfig } from "../mcp.ts";
 import { startMcpRuntime } from "../tools/mcp.ts";
 
 export type OutputFormat = "text" | "json";
@@ -31,6 +31,8 @@ export interface OneShotOptions {
   allow?: string[];
   deny?: string[];
   continueSession?: boolean;
+  enableReasoningSummaries?: boolean;
+  additionalMcpConfig?: string;
 }
 
 interface JsonEvent {
@@ -91,6 +93,8 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     agents: customization.agents,
     skills: customization.skills,
     hooks: customization.hooks,
+    enableReasoningSummaries: opts.enableReasoningSummaries,
+    additionalMcpConfig: opts.additionalMcpConfig,
   };
 
   const approvals: ApprovalState = createApprovalState({
@@ -117,8 +121,9 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     },
   });
 
-  // Bring up MCP runtime (global + project .mcp.json) and merge its tools.
-  const mcpConfig = await loadEffectiveMcpConfig();
+  // Bring up MCP runtime (global + project .mcp.json + additional) and merge its tools.
+  let mcpConfig = await loadEffectiveMcpConfig();
+  mcpConfig = await mergeAdditionalMcpConfig(mcpConfig, opts.additionalMcpConfig);
   const mcp = await startMcpRuntime(mcpConfig.servers);
   Object.assign(tools, mcp.tools);
 

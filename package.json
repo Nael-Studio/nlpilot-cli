@@ -18,6 +18,7 @@
     "typescript": "^6.0.3"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.72",
     "@ai-sdk/gateway": "^3.0.104",
     "@inquirer/prompts": "^8.4.2",
     "@modelcontextprotocol/sdk": "^1.29.0",

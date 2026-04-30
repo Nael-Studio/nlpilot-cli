@@ -9,6 +9,7 @@ export interface Credentials {
   provider: Provider;
   apiKey: string;
   model?: string;
+  baseUrl?: string; // Custom endpoint base URL (e.g., for Azure Foundry)
 }
 
 const CONFIG_DIR = join(homedir(), ".nlpilot");

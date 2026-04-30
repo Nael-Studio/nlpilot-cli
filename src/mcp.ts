@@ -139,3 +139,51 @@ export async function loadEffectiveMcpConfig(cwd: string = process.cwd()): Promi
   for (const s of project.servers) byName.set(s.name, s); // project wins
   return { servers: [...byName.values()] };
 }
+
+/**
+ * Load an MCP config from an arbitrary file path.
+ * Supports both `{ mcpServers: {...} }` and `{ servers: [...] }` formats.
+ */
+export async function loadAdditionalMcpConfig(filePath: string): Promise<MCPConfig> {
+  if (!(await exists(filePath))) {
+    throw new Error(`MCP config file not found: ${filePath}`);
+  }
+  try {
+    const parsed = JSON.parse(await readFile(filePath, "utf8")) as {
+      mcpServers?: Record<string, ProjectServerEntry>;
+      servers?: MCPServer[];
+    };
+    if (parsed.mcpServers && typeof parsed.mcpServers === "object") {
+      const servers = Object.entries(parsed.mcpServers).map(([name, entry]) =>
+        normalizeProjectEntry(name, entry),
+      );
+      return { servers };
+    }
+    if (Array.isArray(parsed.servers)) {
+      return {
+        servers: parsed.servers.map((s) => ({ ...s, source: "project" as const })),
+      };
+    }
+    return { servers: [] };
+  } catch (err) {
+    throw new Error(`Failed to parse MCP config from ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Merge effective config with additional config. Additional entries override existing ones.
+ */
+export async function mergeAdditionalMcpConfig(
+  effectiveConfig: MCPConfig,
+  additionalConfigPath: string | undefined,
+): Promise<MCPConfig> {
+  if (!additionalConfigPath) return effectiveConfig;
+
+  const additional = await loadAdditionalMcpConfig(additionalConfigPath);
+  const byName = new Map<string, MCPServer>();
+
+  for (const s of effectiveConfig.servers) byName.set(s.name, s);
+  for (const s of additional.servers) byName.set(s.name, s); // additional wins
+
+  return { servers: [...byName.values()] };
+}

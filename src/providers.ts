@@ -25,6 +25,16 @@ function inferProvider(modelName: string, fallback: Provider): Provider {
   return fallback;
 }
 
+/**
+ * Instantiate a Vercel AI SDK language model from stored credentials.
+ *
+ * - If `creds.baseUrl` is set, creates a provider client directly (Azure Foundry, etc.).
+ * - Otherwise routes through the AI Gateway using a qualified model ID.
+ *
+ * @param creds - Resolved provider credentials (API key, provider, optional baseUrl).
+ * @param modelOverride - Optional model ID that overrides the stored default.
+ * @returns A Vercel AI SDK `LanguageModel` ready for streaming.
+ */
 export function getModel(creds: Credentials, modelOverride?: string): LanguageModel {
   const modelName = modelOverride ?? creds.model ?? DEFAULT_MODELS[creds.provider];
 
@@ -54,14 +64,4 @@ export function getModel(creds: Credentials, modelOverride?: string): LanguageMo
   // routes to openai regardless of which provider is stored in credentials).
   const qualified = modelName.includes("/")
     ? modelName
-    : `${inferProvider(modelName, creds.provider)}/${modelName}`;
-  return gateway(qualified);
-}
-
-export const PROVIDER_LABELS: Record<Provider, string> = {
-  openai: "OpenAI",
-  anthropic: "Anthropic",
-  google: "Google",
-  deepseek: "DeepSeek",
-  moonshotai: "Moonshot AI",
-};
+    : `${inferProvider

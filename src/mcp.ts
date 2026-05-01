@@ -104,6 +104,14 @@ function normalizeProjectEntry(name: string, entry: ProjectServerEntry): MCPServ
  *   { "mcpServers": { "<name>": { command, args, url, env, type } } }   // Claude Code / Cursor style
  *   { "servers": [ MCPServer, ... ] }                                    // nlpilot internal style
  */
+/**
+ * Load `.mcp.json` from the given working directory.
+ *
+ * Supports both Claude Code / Cursor style (`mcpServers`) and nlpilot native style (`servers`).
+ *
+ * @param cwd - Directory to look for `.mcp.json` in. Defaults to `process.cwd()`.
+ * @returns The parsed project-level MCP config, or an empty config if the file is missing.
+ */
 export async function loadProjectMcpConfig(cwd: string = process.cwd()): Promise<MCPConfig> {
   const path = getProjectMcpConfigPath(cwd);
   if (!(await exists(path))) return { servers: [] };
@@ -132,6 +140,12 @@ export async function loadProjectMcpConfig(cwd: string = process.cwd()): Promise
 /**
  * Merged view of global + project servers. Project entries override global entries with the same name.
  */
+/**
+ * Merge global and project MCP configs. Project entries override global entries with the same name.
+ *
+ * @param cwd - Project directory. Defaults to `process.cwd()`.
+ * @returns A merged MCP config containing both global and project servers.
+ */
 export async function loadEffectiveMcpConfig(cwd: string = process.cwd()): Promise<MCPConfig> {
   const [global, project] = await Promise.all([loadMcpConfig(), loadProjectMcpConfig(cwd)]);
   const byName = new Map<string, MCPServer>();
@@ -143,6 +157,15 @@ export async function loadEffectiveMcpConfig(cwd: string = process.cwd()): Promi
 /**
  * Load an MCP config from an arbitrary file path.
  * Supports both `{ mcpServers: {...} }` and `{ servers: [...] }` formats.
+ */
+/**
+ * Load an MCP configuration from an arbitrary file path.
+ *
+ * Supports both `{ mcpServers: {...} }` and `{ servers: [...] }` formats.
+ *
+ * @param filePath - Absolute or relative path to the MCP JSON file.
+ * @returns The parsed MCP config.
+ * @throws If the file does not exist or cannot be parsed.
  */
 export async function loadAdditionalMcpConfig(filePath: string): Promise<MCPConfig> {
   if (!(await exists(filePath))) {
@@ -172,6 +195,15 @@ export async function loadAdditionalMcpConfig(filePath: string): Promise<MCPConf
 
 /**
  * Merge effective config with additional config. Additional entries override existing ones.
+ */
+/**
+ * Overlay an additional MCP config file on top of the effective config.
+ *
+ * Additional entries override existing ones with the same server name.
+ *
+ * @param effectiveConfig - The base effective config (global + project).
+ * @param additionalConfigPath - Path to an extra MCP JSON file, or `undefined`.
+ * @returns The merged config, or the original effective config if no additional file is provided.
  */
 export async function mergeAdditionalMcpConfig(
   effectiveConfig: MCPConfig,

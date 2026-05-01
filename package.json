@@ -17,6 +17,7 @@
     "@types/node": "^25.6.0",
     "typescript": "^6.0.3"
   },
+  "license": "Apache-2.0",
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.72",
     "@ai-sdk/gateway": "^3.0.104",

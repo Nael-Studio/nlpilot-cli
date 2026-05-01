@@ -57,6 +57,15 @@ const INSTRUCTION_FILENAMES = [
   "INSTRUCTIONS.md",
 ];
 
+/**
+ * Load project-level instruction files from well-known paths.
+ *
+ * Searches for `.nlpilot/instructions.md`, `AGENTS.md`, and `INSTRUCTIONS.md`
+ * in the given working directory.
+ *
+ * @param cwd - Project root to search in. Defaults to `process.cwd()`.
+ * @returns A collection of loaded instruction files.
+ */
 export async function loadInstructions(cwd: string = process.cwd()): Promise<LoadedInstructions> {
   const files: LoadedInstruction[] = [];
   for (const rel of INSTRUCTION_FILENAMES) {
@@ -71,6 +80,12 @@ export async function loadInstructions(cwd: string = process.cwd()): Promise<Loa
   return { files };
 }
 
+/**
+ * Load all project customization assets in parallel.
+ *
+ * @param cwd - Project root to search in. Defaults to `process.cwd()`.
+ * @returns An object containing instructions, custom agents, skills, and hooks.
+ */
 export async function loadCustomization(cwd: string = process.cwd()): Promise<{
   instructions: LoadedInstructions;
   agents: CustomAgent[];
@@ -142,6 +157,15 @@ export function trimMessagesForSending(
   });
 }
 
+/**
+ * Assemble the full system prompt for the current session.
+ *
+ * Includes the base assistant persona, context-efficiency rules, mode guidance,
+ * project instructions, available skills, and source file tree.
+ *
+ * @param session - The active session containing customization and state.
+ * @returns The complete system prompt string.
+ */
 export function buildSystemPrompt(session: Session): string {
   const base =
     "You are nlpilot, a helpful AI coding assistant running in a terminal.\n" +

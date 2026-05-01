@@ -52,6 +52,12 @@ function logToolCall(name: string, summary: string): void {
 
 const MAX_VIEW_LINES = 200; // max lines returned by the view tool per call
 
+/**
+ * Build the complete set of built-in tools available to the agent.
+ *
+ * @param deps - Shared dependencies including approval state, prompt function, and file change recorder.
+ * @returns A Vercel AI SDK `ToolSet` containing view, bash, edit, create, list_dir, glob, and grep.
+ */
 export function buildTools(deps: ToolDeps): ToolSet {
   const { approvals, prompt, recorder, viewedFiles, editedFiles } = deps;
 

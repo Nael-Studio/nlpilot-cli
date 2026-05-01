@@ -31,6 +31,12 @@ function fileForId(cwd: string, id: string): string {
   return join(dirForCwd(cwd), `${id}.json`);
 }
 
+/**
+ * Persist a session to disk under `~/.nlpilot/sessions/<cwd-hash>/`.
+ *
+ * @param session - The session to save.
+ * @returns The full path to the written JSON file.
+ */
 export async function saveSession(session: PersistedSession): Promise<string> {
   const dir = dirForCwd(session.cwd);
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -51,6 +57,12 @@ async function safeReaddir(dir: string): Promise<string[]> {
   }
 }
 
+/**
+ * List all persisted sessions for the given working directory, sorted by most recent first.
+ *
+ * @param cwd - Working directory to look up sessions for. Defaults to `process.cwd()`.
+ * @returns An array of parsed session objects. Corrupt files are silently skipped.
+ */
 export async function listSessions(
   cwd: string = process.cwd(),
 ): Promise<PersistedSession[]> {
@@ -69,6 +81,13 @@ export async function listSessions(
   return out;
 }
 
+/**
+ * Load a single persisted session by its ID.
+ *
+ * @param id - The session identifier.
+ * @param cwd - Working directory the session belongs to. Defaults to `process.cwd()`.
+ * @returns The parsed session, or `null` if the file does not exist.
+ */
 export async function loadSession(
   id: string,
   cwd: string = process.cwd(),
@@ -81,6 +100,13 @@ export async function loadSession(
   }
 }
 
+/**
+ * Find a session by its human-readable name.
+ *
+ * @param name - The session name to search for.
+ * @param cwd - Working directory to search within. Defaults to `process.cwd()`.
+ * @returns The first matching session, or `null` if none found.
+ */
 export async function loadSessionByName(
   name: string,
   cwd: string = process.cwd(),
@@ -89,6 +115,12 @@ export async function loadSessionByName(
   return sessions.find((s) => s.name === name) ?? null;
 }
 
+/**
+ * Load the most recently updated session for the given working directory.
+ *
+ * @param cwd - Working directory to search within. Defaults to `process.cwd()`.
+ * @returns The most recent session, or `null` if no sessions exist.
+ */
 export async function loadMostRecentSession(
   cwd: string = process.cwd(),
 ): Promise<PersistedSession | null> {
@@ -96,6 +128,13 @@ export async function loadMostRecentSession(
   return sessions[0] ?? null;
 }
 
+/**
+ * Delete a persisted session by ID.
+ *
+ * @param id - The session identifier.
+ * @param cwd - Working directory the session belongs to. Defaults to `process.cwd()`.
+ * @returns `true` if the file was deleted, `false` if it did not exist.
+ */
 export async function deleteSession(
   id: string,
   cwd: string = process.cwd(),
@@ -109,6 +148,14 @@ export async function deleteSession(
   }
 }
 
+/**
+ * Rename (set the display name of) an existing session.
+ *
+ * @param id - The session identifier.
+ * @param name - The new human-readable name.
+ * @param cwd - Working directory the session belongs to. Defaults to `process.cwd()`.
+ * @returns `true` if the session was found and updated, `false` otherwise.
+ */
 export async function renameSession(
   id: string,
   name: string,
@@ -122,6 +169,11 @@ export async function renameSession(
   return true;
 }
 
+/**
+ * Generate a new unique session identifier.
+ *
+ * @returns A base-36 timestamp + random suffix string.
+ */
 export function newSessionId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }

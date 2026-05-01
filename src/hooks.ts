@@ -29,6 +29,12 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
+/**
+ * Load lifecycle hooks from `.nlpilot/hooks/hooks.json` or `config.json`.
+ *
+ * @param cwd - Project root to search for the `.nlpilot/hooks/` directory. Defaults to `process.cwd()`.
+ * @returns A hooks configuration object, or an empty config if no hooks are defined.
+ */
 export async function loadHooks(cwd: string = process.cwd()): Promise<HooksConfig> {
   const dir = join(cwd, ".nlpilot", "hooks");
   if (!(await exists(dir))) return { hooks: [] };
@@ -55,6 +61,15 @@ export interface HookContext {
   cwd?: string;
 }
 
+/**
+ * Execute all hooks matching the given event and optional tool-name filter.
+ *
+ * Hooks run sequentially. Errors are silently swallowed so hooks can never crash the REPL.
+ *
+ * @param cfg - The loaded hooks configuration.
+ * @param event - The lifecycle event to trigger.
+ * @param ctx - Contextual data passed to each hook (tool name, I/O, session ID, etc.).
+ */
 export async function runHooks(
   cfg: HooksConfig,
   event: HookEvent,

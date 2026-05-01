@@ -232,7 +232,9 @@ export function getModelCatalog(): Record<Provider, ModelOption[]> {
 }
 
 /**
- * Pre-load the model catalog from disk.
+ * Initialize the in-memory model catalog by reading `~/.nlpilot/models.json`.
+ *
+ * Falls back to the embedded `FALLBACK_CATALOG` if the file is missing or unreadable.
  */
 export async function initializeModelCatalog(): Promise<void> {
   await loadModelCatalog();
@@ -251,7 +253,10 @@ export function listModels(provider: Provider): ModelOption[] {
 
 /**
  * Returns the context window size (tokens) for a given provider/model pair.
- * Falls back to 128 000 tokens when the model is not in the catalog.
+ *
+ * @param provider - The LLM provider enum value.
+ * @param modelId - The model identifier (e.g., "gpt-5.5", "claude-sonnet-4.6").
+ * @returns The context size in tokens, or `128_000` if the model is not in the catalog.
  */
 export function getModelContextSize(provider: Provider, modelId: string): number {
   const catalog = getModelCatalog();

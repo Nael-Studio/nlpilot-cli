@@ -465,6 +465,12 @@ src/
 
 ---
 
+## Developer Documentation
+
+- [Architecture Overview](ARCHITECTURE.md) — how the codebase fits together
+- [Contributing Guide](CONTRIBUTING.md) — setup, style, and PR workflow
+- [docs/](docs/) — detailed guides for extending commands, providers, MCP, skills, and hooks
+
 ## License
 
-MIT
+Licensed under the [Apache License 2.0](LICENSE).

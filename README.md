@@ -276,10 +276,10 @@ Define lifecycle hooks in `.nlpilot/hooks.json` to run shell scripts before/afte
 | Model ID | Description |
 |---|---|
 | `claude-sonnet-4.6` | Balanced flagship · 1M ctx |
-| `claude-opus-4-7` | Top quality · 1M ctx |
-| `claude-haiku-4-5` | Fast & cheap · 200K ctx |
+| `claude-opus-4.7` | Top quality · 1M ctx |
+| `claude-haiku-4.5` | Fast & cheap · 200K ctx |
 | `claude-opus-4-6` | High quality · 1M ctx |
-| `claude-sonnet-4-5` | Balanced · 1M ctx |
+| `claude-sonnet-4.5` | Balanced · 1M ctx |
 | `claude-3-haiku` | Cheapest · 200K ctx |
 
 ### OpenAI

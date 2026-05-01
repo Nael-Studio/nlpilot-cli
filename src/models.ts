@@ -66,7 +66,7 @@ export const MODEL_CATALOG: Record<Provider, ModelOption[]> = {
   ],
   anthropic: [
     {
-      id: "claude-opus-4-7",
+      id: "claude-opus-4.7",
       label: "claude-opus-4.7",
       description: "Top quality · 1M ctx · 70tps · $5/$25 per M",
     },
@@ -81,7 +81,7 @@ export const MODEL_CATALOG: Record<Provider, ModelOption[]> = {
       description: "High quality · 1M ctx · 58tps · $5/$25 per M",
     },
     {
-      id: "claude-sonnet-4-5",
+      id: "claude-sonnet-4.5",
       label: "claude-sonnet-4.5",
       description: "Balanced · 1M ctx · 60tps · $3/$15 per M",
     },
@@ -91,7 +91,7 @@ export const MODEL_CATALOG: Record<Provider, ModelOption[]> = {
       description: "High quality · 200K ctx · 51tps · $5/$25 per M",
     },
     {
-      id: "claude-haiku-4-5",
+      id: "claude-haiku-4.5",
       label: "claude-haiku-4.5",
       description: "Fast & cheap · 200K ctx · 123tps · $1/$5 per M",
     },

@@ -38,6 +38,8 @@ export interface Session {
   additionalMcpConfig?: string;
   cumulativeInputTokens: number; // Actual tokens from API
   cumulativeOutputTokens: number; // Actual tokens from API
+  /** Compact list of source files in cwd, injected at session start to avoid discovery tool calls. */
+  sourceFiles?: string[];
 }
 
 export interface LoadedInstruction {
@@ -92,8 +94,10 @@ export async function loadCustomization(cwd: string = process.cwd()): Promise<{
  */
 export function trimMessagesForSending(
   messages: ModelMessage[],
-  keepFullTurns = 3,
+  keepFullTurns = 1,
   maxResultChars = 800,
+  /** Results shorter than this are never trimmed (default: 200 chars). */
+  minCharsBefore = 200,
 ): ModelMessage[] {
   // Count assistant turns from the end to find the cutoff index
   let assistantTurnsSeen = 0;
@@ -116,10 +120,22 @@ export function trimMessagesForSending(
     const compressedParts = parts.map((part) => {
       const resultStr =
         typeof part.output === "string" ? part.output : JSON.stringify(part.output);
-      if (resultStr.length <= maxResultChars) return part;
+
+      // Never trim small results — they're already compact.
+      if (resultStr.length < minCharsBefore) return part;
+
+      // Adaptive cap: give error messages more breathing room since errors
+      // are usually dense and important for diagnosis.
+      const hasError = resultStr.includes("Error") || resultStr.includes("error");
+      const cap = hasError ? Math.max(maxResultChars, 1_500) : maxResultChars;
+
+      if (resultStr.length <= cap) return part;
       return {
         ...part,
-        output: { type: "text" as const, value: `[output trimmed — ${resultStr.length} chars]` },
+        output: {
+          type: "text" as const,
+          value: `${resultStr.slice(0, cap)}\n[output trimmed — ${resultStr.length - cap} chars]`,
+        },
       };
     });
     return { ...msg, content: compressedParts };
@@ -129,13 +145,21 @@ export function trimMessagesForSending(
 export function buildSystemPrompt(session: Session): string {
   const base =
     "You are nlpilot, a helpful AI coding assistant running in a terminal.\n" +
-    "Tools available: bash, view, edit, create, glob, grep, web_fetch, plus any registered MCP tools.\n\n" +
-    "CONTEXT EFFICIENCY (important):\n" +
-    "- Never read entire files unless they are clearly small. Default to `view` with `startLine`/`endLine`.\n" +
-    "- Use `glob` to discover files; do NOT scan whole directories with `view`.\n" +
-    "- Use `grep` first to locate symbols/strings, then `view` only the narrow line range around the hit (use `contextLines` for ~5 lines around).\n" +
-    "- Prefer one targeted tool call over many wide ones; do not pre-load files ‘just in case’.\n" +
-    "- Stop reading once you have enough to act.\n\n" +
+    "Tools available: view (read file lines), bash, edit, create, grep (also does file discovery via filenamesOnly:true), web_fetch, plus any registered MCP tools.\n\n" +
+    "CONTEXT EFFICIENCY — follow strictly, every violation costs real money:\n" +
+    "1. The file tree below already tells you every file that exists. NEVER run discovery calls to find files.\n" +
+    "2. If the user's request can be answered with a clarifying question (e.g. 'the loader already exists in src/ui/loader.ts — which command should it be added to?'), ask first WITHOUT reading any files.\n" +
+    "3. For 'add X to multiple files' tasks: use `grep` to find ONE existing usage of X (with contextLines:3), then apply the same pattern to other files via `edit`. Do NOT read every target file first.\n" +
+    "4. For targeted edits: use `grep` with a precise pattern to find the exact insertion point (contextLines:5), then `edit` directly. Only call `view` if grep cannot give you enough context.\n" +
+    "5. `view` is a last resort. If you use it, read at least 150 lines in one call. NEVER view the same file twice in one turn.\n" +
+    "6. Do NOT read a file before or after an edit to verify it — trust the edit succeeded.\n" +
+    "BANNED PATTERNS — never use these:\n" +
+    "- `bash find`, `bash ls`, `bash ls -la` → file list is already in the system prompt.\n" +
+    "- `bash sed -n`, `bash cat FILE`, `bash head -N FILE` → use the `view` tool instead.\n" +
+    "- `bash wc -l`, `bash cat FILE | grep` → use the `grep` tool directly.\n" +
+    "- Reading files 'to understand the pattern' before making an edit — use grep with contextLines instead.\n" +
+    "- Reading README, docs, or large markdown files unless explicitly asked about them.\n" +
+    "For open-ended questions about the project, answer from your training knowledge. Only use tools when making a concrete code change.\n\n" +
     "Be concise.";
 
   let modeNote = "\n\nMODE: ask. Ask the user before taking non-trivial actions.";
@@ -151,7 +175,19 @@ export function buildSystemPrompt(session: Session): string {
     session.instructions.files.length > 0
       ? "\n\n--- Project instructions ---\n" +
         session.instructions.files
-          .map((f) => `# ${f.path}\n${f.content}`)
+          .map((f) => {
+            const estTokens = Math.ceil(f.content.length / 4);
+            const MAX_INSTRUCTION_CHARS = 60_000; // ~15 k tokens
+            if (f.content.length > MAX_INSTRUCTION_CHARS) {
+              return (
+                `# ${f.path}\n` +
+                `[Warning: file is ~${estTokens.toLocaleString()} estimated tokens — too large. Showing first portion only.]\n` +
+                f.content.slice(0, MAX_INSTRUCTION_CHARS) +
+                "\n…"
+              );
+            }
+            return `# ${f.path}\n${f.content}`;
+          })
           .join("\n\n")
       : "";
 
@@ -171,5 +207,12 @@ export function buildSystemPrompt(session: Session): string {
           .join("\n")
       : "";
 
-  return base + modeNote + instrBlock + skillsBlock + agentsBlock;
+  const fileTreeBlock =
+    session.sourceFiles && session.sourceFiles.length > 0
+      ? "\n\n--- Project files (COMPLETE list — do not run any discovery commands) ---\n" +
+        session.sourceFiles.join("\n") +
+        "\n--- End of file list. You know all files. Skip discovery entirely. ---"
+      : "";
+
+  return base + modeNote + instrBlock + skillsBlock + agentsBlock + fileTreeBlock;
 }

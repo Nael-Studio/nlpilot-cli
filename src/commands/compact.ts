@@ -1,4 +1,4 @@
-import { generateText, type ModelMessage } from "ai";
+import { generateText, type ModelMessage, type ToolModelMessage } from "ai";
 import kleur from "kleur";
 import type { Session } from "../session.ts";
 
@@ -11,16 +11,39 @@ export function estimateTokens(messages: ModelMessage[]): number {
   return total;
 }
 
+/** Max chars kept per tool result when building the compact transcript. */
+const COMPACT_TOOL_RESULT_CAP = 400;
+
+/**
+ * Serialise messages into a compact transcript for summarization.
+ * Tool results (file reads, bash output) are truncated so the summarizer
+ * call itself doesn't reproduce the full 180k context.
+ */
+export function buildCompactTranscript(messages: ModelMessage[]): string {
+  return messages
+    .map((m) => {
+      if (m.role === "tool") {
+        const parts = (m as ToolModelMessage).content
+          .filter((p) => p.type === "tool-result")
+          .map((p) => {
+            const raw = typeof p.output === "string" ? p.output : JSON.stringify(p.output);
+            const trimmed = raw.length > COMPACT_TOOL_RESULT_CAP
+              ? raw.slice(0, COMPACT_TOOL_RESULT_CAP) + `…[+${raw.length - COMPACT_TOOL_RESULT_CAP} chars]`
+              : raw;
+            return `[tool:${p.toolName}] ${trimmed}`;
+          });
+        return `TOOL: ${parts.join("\n")}`;
+      }
+      const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      return `${m.role.toUpperCase()}: ${content}`;
+    })
+    .join("\n\n");
+}
+
 export async function runAutoCompact(session: Session): Promise<void> {
   if (session.messages.length === 0) return;
   try {
-    const transcript = session.messages
-      .map((m) => {
-        const content =
-          typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-        return `${m.role.toUpperCase()}: ${content}`;
-      })
-      .join("\n\n");
+    const transcript = buildCompactTranscript(session.messages);
     const result = await generateText({
       model: session.languageModel,
       system:

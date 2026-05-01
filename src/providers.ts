@@ -16,6 +16,12 @@ function inferProvider(modelName: string, fallback: Provider): Provider {
   if (modelName.startsWith("gemini-") || modelName.startsWith("models/gemini")) {
     return "google";
   }
+  if (modelName.startsWith("deepseek-")) {
+    return "deepseek";
+  }
+  if (modelName.startsWith("kimi-") || modelName.startsWith("moonshotai/")) {
+    return "moonshotai";
+  }
   return fallback;
 }
 
@@ -56,4 +62,6 @@ export const PROVIDER_LABELS: Record<Provider, string> = {
   openai: "OpenAI",
   anthropic: "Anthropic",
   google: "Google",
+  deepseek: "DeepSeek",
+  moonshotai: "Moonshot AI",
 };

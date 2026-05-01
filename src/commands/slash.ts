@@ -2,15 +2,17 @@ import kleur from "kleur";
 import { spawn } from "node:child_process";
 import { unlink, writeFile } from "node:fs/promises";
 import { generateText } from "ai";
+import { buildCompactTranscript } from "./compact.ts";
 import pkg from "../../package.json" with { type: "json" };
 import {
+  buildSystemPrompt,
   loadCustomization,
   loadInstructions,
   type Mode,
   type Session,
   type Theme,
 } from "../session.ts";
-import { listModels } from "../models.ts";
+import { listModels, getModelContextSize } from "../models.ts";
 import { PROVIDER_LABELS, getModel } from "../providers.ts";
 import type { ApprovalState } from "../tools/approval.ts";
 import {
@@ -23,6 +25,7 @@ import {
   getContextStats,
   formatContextStats,
 } from "../telemetry/TokenTracker.ts";
+import { startLoader, stopLoader } from "../ui/loader.ts";
 
 export interface SlashContext {
   session: Session;
@@ -31,6 +34,12 @@ export interface SlashContext {
   printHelp: () => void;
   /** Request app exit (returns true to break the REPL loop). */
   setShouldExit: () => void;
+  /**
+   * Flat list of every registered tool description string.
+   * Used by /stats to estimate tool-schema token overhead that is sent to
+   * the API with every request but not reflected in message history.
+   */
+  toolDescriptions: string[];
 }
 
 export type SlashHandler = (
@@ -151,6 +160,55 @@ const COMMANDS: SlashSpec[] = [
     },
   },
   {
+    names: ["stats"],
+    description: "Show context breakdown: system prompt, messages, cumulative API usage",
+    handler: ({ session, toolDescriptions }) => {
+      const provider = session.creds.provider;
+      const modelId = session.modelName;
+      const contextSize = getModelContextSize(provider, modelId);
+
+      // Estimate system prompt tokens.
+      const sysPrompt = buildSystemPrompt(session);
+      const sysTokens = Math.ceil(sysPrompt.length / 4);
+
+      // Estimate messages tokens.
+      let msgChars = 0;
+      for (const m of session.messages) {
+        const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+        msgChars += content.length;
+      }
+      const msgTokens = Math.ceil(msgChars / 4);
+
+      // Estimate tool schema tokens: description text + ~150-token JSON schema overhead per tool.
+      // Tool definitions are serialised and sent with EVERY API call, but are
+      // not part of message history, so the message estimate always under-counts.
+      const toolCount = toolDescriptions.length;
+      const toolDescChars = toolDescriptions.reduce((sum, d) => sum + d.length, 0);
+      const toolTokens = Math.ceil(toolDescChars / 4) + toolCount * 150;
+
+      const totalEstimated = sysTokens + msgTokens + toolTokens;
+      const estimatedPct = ((totalEstimated / contextSize) * 100).toFixed(1);
+
+      const cumulativeTotal = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+      const cumulativePct = ((cumulativeTotal / contextSize) * 100).toFixed(1);
+
+      console.log();
+      console.log(kleur.bold("Context Breakdown (estimated)"));
+      console.log(kleur.dim("-".repeat(48)));
+      console.log(`  System prompt   ${sysTokens.toLocaleString().padStart(10)} tokens`);
+      console.log(`  Messages        ${msgTokens.toLocaleString().padStart(10)} tokens  (${session.messages.length} msgs)`);
+      console.log(`  Tool schemas    ${toolTokens.toLocaleString().padStart(10)} tokens  (${toolCount} tools, sent every turn)`);
+      console.log(`  Estimated total ${totalEstimated.toLocaleString().padStart(10)} / ${Math.round(contextSize / 1_000)}k  (${estimatedPct}%)`);
+      console.log();
+      console.log(kleur.bold("Cumulative API Usage (actual)"));
+      console.log(kleur.dim("-".repeat(48)));
+      console.log(`  Input           ${session.cumulativeInputTokens.toLocaleString().padStart(10)} tokens`);
+      console.log(`  Output          ${session.cumulativeOutputTokens.toLocaleString().padStart(10)} tokens`);
+      console.log(`  Total           ${cumulativeTotal.toLocaleString().padStart(10)} / ${Math.round(contextSize / 1_000)}k  (${cumulativePct}%)`);
+      console.log();
+    },
+  },
+  {
     names: ["copy"],
     description: "Copy last assistant response to clipboard",
     handler: async ({ session }) => {
@@ -262,21 +320,15 @@ const COMMANDS: SlashSpec[] = [
       }
       console.log(kleur.dim("Compacting conversation…"));
       try {
-        const transcript = session.messages
-          .map((m) => {
-            const content =
-              typeof m.content === "string"
-                ? m.content
-                : JSON.stringify(m.content);
-            return `${m.role.toUpperCase()}: ${content}`;
-          })
-          .join("\n\n");
+        const transcript = buildCompactTranscript(session.messages);
+        startLoader("Summarizing...");
         const result = await generateText({
           model: session.languageModel,
           system:
             "You are a conversation summarizer. Produce a concise but information-dense summary of the prior assistant/user turns. Preserve decisions, code paths touched, and open TODOs. Do not invent details.",
           prompt: `Summarize the following conversation:\n\n${transcript}`,
         });
+        stopLoader();
         const summary = result.text.trim();
         session.messages = [
           {
@@ -457,18 +509,21 @@ const COMMANDS: SlashSpec[] = [
       }
       console.log(kleur.dim("Drafting plan…"));
       try {
+        startLoader("Planning...");
         const result = await generateText({
           model: session.languageModel,
           system:
             "You are a software planning assistant. Produce a numbered, concrete step-by-step plan for the goal. Each step must be actionable and reference real files when relevant. End with a 'Risks' section.",
           prompt: seed,
         });
+        stopLoader();
         console.log();
         console.log(result.text.trim());
         console.log();
         session.mode = "plan";
         console.log(kleur.green("✓"), "Plan ready — mode set to plan. Switch to /mode autopilot or /mode ask to execute.");
       } catch (err) {
+        stopLoader();
         console.error(kleur.red("✗"), "Plan failed:", err instanceof Error ? err.message : String(err));
       }
     },

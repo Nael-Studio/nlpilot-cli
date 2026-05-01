@@ -161,6 +161,40 @@ const FALLBACK_CATALOG: Record<Provider, ModelOption[]> = {
       contextSize: 128000,
     },
   ],
+  deepseek: [
+    {
+      id: "deepseek-v4-pro",
+      label: "deepseek-v4-pro",
+      description: "Advanced reasoning · 1M ctx · $0.435/$3.48 per M (with 75% discount)",
+      contextSize: 1000000,
+    },
+    {
+      id: "deepseek-v4-flash",
+      label: "deepseek-v4-flash",
+      description: "Fast & efficient · 1M ctx · $0.14/$0.28 per M",
+      contextSize: 1000000,
+    },
+    {
+      id: "deepseek-v3.2",
+      label: "deepseek-v3.2",
+      description: "Previous generation · fast inference",
+      contextSize: 128000,
+    },
+    {
+      id: "deepseek-v3.2-thinking",
+      label: "deepseek-v3.2-thinking",
+      description: "Previous generation with extended thinking",
+      contextSize: 128000,
+    },
+  ],
+  moonshotai: [
+    {
+      id: "kimi-k2.6",
+      label: "kimi-k2.6",
+      description: "Kimi K2.6 · 262K ctx · $0.95/$4.00 per M",
+      contextSize: 262000,
+    },
+  ],
 };
 
 let cachedCatalog: Record<Provider, ModelOption[]> | null = null;
@@ -213,4 +247,15 @@ export const MODEL_CATALOG: Record<Provider, ModelOption[]> = FALLBACK_CATALOG;
 
 export function listModels(provider: Provider): ModelOption[] {
   return getModelCatalog()[provider];
+}
+
+/**
+ * Returns the context window size (tokens) for a given provider/model pair.
+ * Falls back to 128 000 tokens when the model is not in the catalog.
+ */
+export function getModelContextSize(provider: Provider, modelId: string): number {
+  const catalog = getModelCatalog();
+  const models = catalog[provider] ?? [];
+  const model = models.find((m) => m.id === modelId);
+  return model?.contextSize ?? 128_000;
 }

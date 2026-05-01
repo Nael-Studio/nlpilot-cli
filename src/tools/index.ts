@@ -17,8 +17,7 @@ export interface FileChangeRecorder {
 }
 
 const MAX_OUTPUT = 8_000;   // bash stdout/stderr cap per call
-const VIEW_DEFAULT_LINES = 80;  // default lines returned by view (no range given)
-const VIEW_MAX_BYTES = 6_000;   // hard byte cap on view output
+const MAX_GREP_OUTPUT = 16_000; // total chars across all grep matches
 
 const REGEX_META = new RegExp(String.raw`[.*+?^${"$"}{}()|[\]\\]`, "g");
 
@@ -28,7 +27,12 @@ function truncate(text: string, max = MAX_OUTPUT): string {
 }
 
 function resolveInsideCwd(p: string): string {
-  const abs = path.resolve(process.cwd(), p);
+  const base = process.cwd();
+  const abs = path.resolve(base, p);
+  const rel = path.relative(base, abs);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new TypeError(`Path "${p}" escapes the working directory`);
+  }
   return abs;
 }
 
@@ -36,33 +40,117 @@ interface ToolDeps {
   approvals: ApprovalState;
   prompt: PromptFn;
   recorder: FileChangeRecorder;
+  /** Tracks which absolute paths have been viewed this turn. Reset between turns. */
+  viewedFiles: Set<string>;
+  /** Tracks which absolute paths were edited/created this turn (allows re-view after edit). */
+  editedFiles: Set<string>;
 }
 
 function logToolCall(name: string, summary: string): void {
   console.log(kleur.dim(`  ⚙ ${name}: ${summary}`));
 }
 
+const MAX_VIEW_LINES = 200; // max lines returned by the view tool per call
+
 export function buildTools(deps: ToolDeps): ToolSet {
-  const { approvals, prompt, recorder } = deps;
+  const { approvals, prompt, recorder, viewedFiles, editedFiles } = deps;
 
   return {
+    view: tool({
+      description:
+        "Read lines from a file. Returns at most 200 lines. " +
+        "Choose a wide range that covers everything you need — do NOT call view multiple times on the same file. " +
+        "Omit startLine/endLine to read the first 200 lines.",
+      inputSchema: z.object({
+        path: z.string(),
+        startLine: z.number().int().min(1).optional().describe("1-based inclusive start line"),
+        endLine: z.number().int().min(1).optional().describe("1-based inclusive end line"),
+      }),
+      execute: async ({ path: p, startLine, endLine }) => {
+        let abs: string;
+        try { abs = resolveInsideCwd(p); } catch (err) {
+          return { error: err instanceof Error ? err.message : String(err) };
+        }
+        logToolCall("view", `${p}${startLine != null ? ` L${startLine}-${endLine ?? "…"}` : ""}`);
+        // Reject directory paths — use grep with filenamesOnly:true for listings.
+        let stat: Awaited<ReturnType<typeof fs.stat>>;
+        try { stat = await fs.stat(abs); } catch (err) {
+          return { error: `Cannot stat path: ${err instanceof Error ? err.message : String(err)}` };
+        }
+        if (stat.isDirectory()) {
+          return { error: `"${p}" is a directory. Use grep with filenamesOnly:true to list its contents.` };
+        }
+        // Reject re-reads unless the file was edited this turn.
+        if (viewedFiles.has(abs) && !editedFiles.has(abs)) {
+          return {
+            error: `Already read "${p}" this turn. Use the content from the previous view result instead of re-reading.`,
+          };
+        }
+        viewedFiles.add(abs);
+        let content: string;
+        try {
+          content = await fs.readFile(abs, "utf8");
+        } catch (err) {
+          return { error: `Cannot read file: ${err instanceof Error ? err.message : String(err)}` };
+        }
+        const lines = content.split("\n");
+        const total = lines.length;
+        const s = Math.max(1, startLine ?? 1);
+        // Enforce a minimum read of MIN_VIEW_LINES lines so the model can't
+        // request tiny slices and then loop with follow-up calls.
+        const MIN_VIEW_LINES = 150;
+        const requestedEnd = endLine != null ? Math.min(total, endLine) : total;
+        const enforcedEnd = Math.max(requestedEnd, Math.min(total, s + MIN_VIEW_LINES - 1));
+        const capped = Math.min(enforcedEnd, s + MAX_VIEW_LINES - 1);
+        const slice = lines
+          .slice(s - 1, capped)
+          .map((l, i) => `${s + i}: ${l}`)
+          .join("\n");
+        return {
+          path: p,
+          startLine: s,
+          endLine: capped,
+          totalLines: total,
+          content: slice,
+          ...(capped < enforcedEnd
+            ? { note: `Capped at ${MAX_VIEW_LINES} lines. Call again with startLine: ${capped + 1} for more.` }
+            : capped < total
+              ? { note: `File has ${total} lines total. Use startLine/endLine to read other sections.` }
+              : undefined),
+        };
+      },
+    }),
+
     bash: tool({
       description:
-        "Execute a shell command. Always asks the user for approval first. Returns combined stdout/stderr and the exit code.",
+        "Run a shell command. Use ONLY for computation, compilation, running tests, or operations that have no dedicated tool. " +
+        "Do NOT use for: file discovery (use grep filenamesOnly:true), reading files (use view), searching text (use grep).",
       inputSchema: z.object({
-        command: z.string().describe("Shell command to execute via /bin/sh -c"),
-        cwd: z
-          .string()
-          .optional()
-          .describe("Working directory (defaults to current cwd)"),
-        timeoutMs: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .describe("Optional timeout in milliseconds"),
+        command: z.string(),
+        cwd: z.string().optional(),
       }),
-      execute: async ({ command, cwd, timeoutMs }) => {
+      execute: async ({ command, cwd }) => {
+        // Reject commands that should use dedicated tools instead.
+        const trimmed = command.trimStart();
+        const BANNED = [
+          { re: /^(ls|ls\s)/, alt: "grep with filenamesOnly:true" },
+          { re: /^find\s/, alt: "grep with filenamesOnly:true" },
+          { re: /^cat\s/, alt: "the view tool" },
+          { re: /^head\s/, alt: "the view tool with startLine/endLine" },
+          { re: /^tail\s/, alt: "the view tool with startLine/endLine" },
+          { re: /^wc\s/, alt: "the view tool (check totalLines in response)" },
+          { re: /^grep\s/, alt: "the grep tool" },
+          { re: /^sed\s+-n\s+['"]?\d/, alt: "the view tool with startLine/endLine" },
+          { re: /^glob\s/, alt: "grep with filenamesOnly:true" },
+        ];
+        for (const { re, alt } of BANNED) {
+          if (re.test(trimmed)) {
+            return {
+              error: `This command is not allowed via bash. Use ${alt} instead.`,
+              bannedCommand: command,
+            };
+          }
+        }
         const decision = await requestApproval(approvals, prompt, {
           toolName: "bash",
           summary: `Run: ${command}`,
@@ -75,7 +163,6 @@ export function buildTools(deps: ToolDeps): ToolSet {
           stdout: string;
           stderr: string;
           exitCode: number | null;
-          timedOut?: boolean;
         }>((resolve) => {
           const child = spawn("/bin/sh", ["-c", command], {
             cwd: cwd ?? process.cwd(),
@@ -83,120 +170,30 @@ export function buildTools(deps: ToolDeps): ToolSet {
           });
           let stdout = "";
           let stderr = "";
-          let timedOut = false;
-          const timer = timeoutMs
-            ? setTimeout(() => {
-                timedOut = true;
-                child.kill("SIGTERM");
-              }, timeoutMs)
-            : null;
-          child.stdout.on("data", (d) => {
-            stdout += d.toString();
-          });
-          child.stderr.on("data", (d) => {
-            stderr += d.toString();
-          });
+          child.stdout.on("data", (d) => { stdout += d.toString(); });
+          child.stderr.on("data", (d) => { stderr += d.toString(); });
           child.on("close", (code) => {
-            if (timer) clearTimeout(timer);
-            resolve({
-              stdout: truncate(stdout),
-              stderr: truncate(stderr),
-              exitCode: code,
-              timedOut: timedOut || undefined,
-            });
+            resolve({ stdout: truncate(stdout), stderr: truncate(stderr), exitCode: code });
           });
           child.on("error", (err) => {
-            if (timer) clearTimeout(timer);
-            resolve({
-              stdout,
-              stderr: stderr + "\n" + err.message,
-              exitCode: -1,
-            });
+            resolve({ stdout, stderr: stderr + "\n" + err.message, exitCode: -1 });
           });
         });
       },
     }),
 
-    view: tool({
-      description:
-        "Read a slice of a file or list a directory. ALWAYS prefer narrow line ranges over whole-file reads. Without a range, only the first 200 lines (capped at ~16KB) are returned with a `totalLines` hint so you can request more.",
-      inputSchema: z.object({
-        path: z.string().describe("Relative or absolute path"),
-        startLine: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .describe("1-based start line (files only)"),
-        endLine: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .describe("1-based inclusive end line (files only)"),
-        maxLines: z
-          .number()
-          .int()
-          .positive()
-          .max(2000)
-          .optional()
-          .describe("Cap on number of lines returned (default 200)"),
-      }),
-      execute: async ({ path: p, startLine, endLine, maxLines }) => {
-        const abs = resolveInsideCwd(p);
-        logToolCall("view", abs);
-        try {
-          const stat = await fs.stat(abs);
-          if (stat.isDirectory()) {
-            const entries = await fs.readdir(abs, { withFileTypes: true });
-            return {
-              type: "directory",
-              path: abs,
-              entries: entries.map((e) => ({
-                name: e.name + (e.isDirectory() ? "/" : ""),
-                isDirectory: e.isDirectory(),
-              })),
-            };
-          }
-          const content = await fs.readFile(abs, "utf8");
-          const lines = content.split("\n");
-          const totalLines = lines.length;
-          const cap = Math.min(maxLines ?? VIEW_DEFAULT_LINES, 2000);
-          const s = (startLine ?? 1) - 1;
-          const requestedEnd = endLine ?? s + cap;
-          const e = Math.min(requestedEnd, s + cap, totalLines);
-          const slice = lines.slice(s, e).join("\n");
-          const truncatedBytes = slice.length > VIEW_MAX_BYTES;
-          const body = truncatedBytes ? slice.slice(0, VIEW_MAX_BYTES) : slice;
-          return {
-            type: "file",
-            path: abs,
-            startLine: s + 1,
-            endLine: e,
-            totalLines,
-            content: body,
-            truncated: truncatedBytes || e < totalLines,
-            hint:
-              e < totalLines
-                ? `Showed lines ${s + 1}-${e} of ${totalLines}. Call view again with startLine=${e + 1} for more.`
-                : undefined,
-          };
-        } catch (err) {
-          return { error: err instanceof Error ? err.message : String(err) };
-        }
-      },
-    }),
-
     edit: tool({
-      description:
-        "Edit a file by replacing an exact string with a new string. The oldString must appear exactly once. Asks for user approval.",
+      description: "Replace unique oldString with newString in a file.",
       inputSchema: z.object({
         path: z.string(),
-        oldString: z.string().describe("Exact text to replace; must be unique"),
-        newString: z.string().describe("Replacement text"),
+        oldString: z.string().describe("Must appear exactly once in the file"),
+        newString: z.string(),
       }),
       execute: async ({ path: p, oldString, newString }) => {
-        const abs = resolveInsideCwd(p);
+        let abs: string;
+        try { abs = resolveInsideCwd(p); } catch (err) {
+          return { error: err instanceof Error ? err.message : String(err) };
+        }
         let content: string;
         try {
           content = await fs.readFile(abs, "utf8");
@@ -220,19 +217,23 @@ export function buildTools(deps: ToolDeps): ToolSet {
         const next = content.slice(0, idx) + newString + content.slice(idx + oldString.length);
         await fs.writeFile(abs, next, "utf8");
         recorder.record({ path: abs, before: content, after: next, tool: "edit" });
+        editedFiles.add(abs);
+        viewedFiles.delete(abs); // allow re-read after edit
         return { ok: true, path: abs, bytes: next.length };
       },
     }),
 
     create: tool({
-      description:
-        "Create a new file with the given content. Fails if the file already exists. Asks for user approval.",
+      description: "Create a new file. Fails if the file already exists.",
       inputSchema: z.object({
         path: z.string(),
         content: z.string(),
       }),
       execute: async ({ path: p, content }) => {
-        const abs = resolveInsideCwd(p);
+        let abs: string;
+        try { abs = resolveInsideCwd(p); } catch (err) {
+          return { error: err instanceof Error ? err.message : String(err) };
+        }
         try {
           await fs.access(abs);
           return { error: "File already exists" };
@@ -249,65 +250,46 @@ export function buildTools(deps: ToolDeps): ToolSet {
         await fs.mkdir(path.dirname(abs), { recursive: true });
         await fs.writeFile(abs, content, "utf8");
         recorder.record({ path: abs, before: null, after: content, tool: "create" });
+        editedFiles.add(abs);
         return { ok: true, path: abs, bytes: content.length };
       },
     }),
 
-    glob: tool({
-      description:
-        "Find files matching a glob pattern, relative to the current working directory. Examples: 'src/**/*.ts', '**/*.md'.",
-      inputSchema: z.object({
-        pattern: z.string(),
-        cwd: z.string().optional(),
-        limit: z.number().int().positive().max(1000).optional(),
-      }),
-      execute: async ({ pattern, cwd, limit }) => {
-        const base = cwd ? resolveInsideCwd(cwd) : process.cwd();
-        logToolCall("glob", `${pattern} @ ${base}`);
-        const glob = new Glob(pattern);
-        const results: string[] = [];
-        const max = limit ?? 200;
-        for await (const match of glob.scan({ cwd: base, onlyFiles: true })) {
-          results.push(match);
-          if (results.length >= max) break;
-        }
-        return { pattern, cwd: base, count: results.length, files: results };
-      },
-    }),
-
     grep: tool({
-      description:
-        "Search for a regex or literal string in files matching a glob pattern. Returns matching lines with file paths and line numbers, plus optional surrounding context. Use this to locate code, then `view` only the narrow line range you need.",
+      description: "Search file content by pattern. Set filenamesOnly:true to list files matching a name glob instead (replaces glob tool).",
       inputSchema: z.object({
-        pattern: z.string().describe("Regex or literal text to search for"),
-        glob: z.string().optional().describe("File glob (default: '**/*')"),
-        regex: z.boolean().optional().describe("Treat pattern as regex (default: false)"),
+        pattern: z.string().describe("Content pattern, or filename glob when filenamesOnly:true"),
+        glob: z.string().optional(),
+        regex: z.boolean().optional(),
         ignoreCase: z.boolean().optional(),
-        contextLines: z
-          .number()
-          .int()
-          .min(0)
-          .max(10)
-          .optional()
-          .describe("Lines of context around each match (default 0)"),
-        maxMatches: z.number().int().positive().max(2000).optional(),
+        contextLines: z.number().int().min(0).max(10).optional(),
+        filenamesOnly: z.boolean().optional(),
       }),
-      execute: async ({ pattern, glob, regex, ignoreCase, contextLines, maxMatches }) => {
+      execute: async ({ pattern, glob, regex, ignoreCase, contextLines, filenamesOnly }) => {
         const base = process.cwd();
+
+        if (filenamesOnly) {
+          logToolCall("grep/files", pattern);
+          const g = new Glob(pattern);
+          const results: string[] = [];
+          for await (const file of g.scan({ cwd: base, onlyFiles: true })) {
+            results.push(file);
+            if (results.length >= 200) break;
+          }
+          return { pattern, count: results.length, files: results };
+        }
+
+        logToolCall("grep", `"${pattern}" in ${glob ?? "**/*"}`);
         const g = new Glob(glob ?? "**/*");
         let re: RegExp;
         try {
           const flags = ignoreCase ? "i" : "";
           re = regex
             ? new RegExp(pattern, flags)
-            : new RegExp(
-                pattern.replaceAll(REGEX_META, String.raw`\$&`),
-                flags,
-              );
+            : new RegExp(pattern.replaceAll(REGEX_META, String.raw`\$&`), flags);
         } catch (err) {
           return { error: err instanceof Error ? err.message : String(err) };
         }
-        const limit = maxMatches ?? 200;
         const ctx = contextLines ?? 0;
         const matches: Array<{
           file: string;
@@ -315,10 +297,8 @@ export function buildTools(deps: ToolDeps): ToolSet {
           text: string;
           context?: string[];
         }> = [];
-        outer: for await (const file of g.scan({
-          cwd: base,
-          onlyFiles: true,
-        })) {
+        let totalChars = 0;
+        outer: for await (const file of g.scan({ cwd: base, onlyFiles: true })) {
           let content: string;
           try {
             content = await fs.readFile(path.join(base, file), "utf8");
@@ -342,22 +322,46 @@ export function buildTools(deps: ToolDeps): ToolSet {
                   .map((l, j) => `${start + j + 1}: ${l.slice(0, 300)}`);
               }
               matches.push(entry);
-              if (matches.length >= limit) break outer;
+              totalChars += entry.text.length + (entry.context?.join("").length ?? 0);
+              if (matches.length >= 200 || totalChars >= MAX_GREP_OUTPUT) break outer;
             }
           }
         }
-        return { pattern, count: matches.length, matches };
+        const truncatedBySize = totalChars >= MAX_GREP_OUTPUT;
+        return {
+          pattern,
+          count: matches.length,
+          matches,
+          ...(truncatedBySize
+            ? { note: `Output cap reached (${MAX_GREP_OUTPUT} chars). Results are partial — use a more specific pattern or glob.` }
+            : matches.length >= 200
+              ? { note: `Match cap reached (200). Consider a more specific pattern or glob.` }
+              : matches.length > 50
+                ? { note: `Large result set (${matches.length} matches). Consider a more specific pattern or glob.` }
+                : undefined),
+        };
       },
     }),
 
     web_fetch: tool({
-      description:
-        "Fetch a URL and return its text content (HTML stripped to plain text). Asks for user approval.",
+      description: "Fetch a URL and return its text (HTML stripped to plain text). Only public URLs are allowed.",
       inputSchema: z.object({
         url: z.url(),
         method: z.enum(["GET", "POST"]).optional(),
       }),
       execute: async ({ url, method }) => {
+        // SSRF guard: block requests to private/loopback networks
+        let parsedUrl: URL;
+        try {
+          parsedUrl = new URL(url);
+        } catch {
+          return { error: "Invalid URL" };
+        }
+        const hostname = parsedUrl.hostname.toLowerCase();
+        const PRIVATE = /^(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|::1|fc00:|fe80:|0\.0\.0\.0|169\.254\.)/;
+        if (PRIVATE.test(hostname)) {
+          return { error: "Requests to private/loopback addresses are not allowed" };
+        }
         const decision = await requestApproval(approvals, prompt, {
           toolName: "web_fetch",
           summary: `Fetch ${method ?? "GET"} ${url}`,
@@ -376,12 +380,7 @@ export function buildTools(deps: ToolDeps): ToolSet {
               .replaceAll(/\s+/g, " ")
               .trim();
           }
-          return {
-            url,
-            status: res.status,
-            contentType,
-            body: truncate(body),
-          };
+          return { url, status: res.status, contentType, body: truncate(body) };
         } catch (err) {
           return { error: err instanceof Error ? err.message : String(err) };
         }

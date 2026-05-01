@@ -3,10 +3,12 @@ import { stdin, stdout } from "node:process";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve as pathResolve } from "node:path";
+import { Glob } from "bun";
 import { streamText, stepCountIs } from "ai";
 import kleur from "kleur";
 import { resolveCredentials, DEFAULT_MODELS } from "../config.ts";
 import { getModel, PROVIDER_LABELS } from "../providers.ts";
+import { getModelContextSize } from "../models.ts";
 import { buildTools } from "../tools/index.ts";
 import { createApprovalState } from "../tools/approval.ts";
 import {
@@ -25,6 +27,7 @@ import { runHooks } from "../hooks.ts";
 import { runAutoCompact, estimateTokens } from "./compact.ts";
 import { loadEffectiveMcpConfig, loadProjectMcpConfig, getProjectMcpConfigPath } from "../mcp.ts";
 import { startMcpRuntime } from "../tools/mcp.ts";
+import { startLoader, stopLoader, stopLoaderWithMessage } from "../ui/loader.ts";
 
 interface ReplOptions {
   model?: string;
@@ -119,8 +122,26 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
     cumulativeOutputTokens: priorOutputTokens,
   };
 
+  // Pre-scan source files and inject into system prompt so the model never
+  // needs discovery tool calls (find/ls/glob) to know what files exist.
+  try {
+    const g = new Glob("**/*.{ts,tsx,js,jsx,mjs,mts,json,md}");
+    const files: string[] = [];
+    for await (const f of g.scan({ cwd: process.cwd(), onlyFiles: true })) {
+      if (!f.includes("node_modules") && !f.includes(".git") && !f.startsWith("dist/")) {
+        files.push(f);
+        if (files.length >= 300) break;
+      }
+    }
+    files.sort();
+    session.sourceFiles = files;
+  } catch {
+    // non-fatal — model can still use grep filenamesOnly
+  }
+
   await runHooks(session.hooks, "sessionStart", { sessionId: session.id, cwd: process.cwd() });
 
+  printLogo();
   printBanner(session);
   await announceProjectMcp();
 
@@ -145,9 +166,13 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
         resolve(answer);
       });
     });
+  const viewedFiles = new Set<string>();
+  const editedFiles = new Set<string>();
   const tools = buildTools({
     approvals,
     prompt: promptFn,
+    viewedFiles,
+    editedFiles,
     recorder: {
       record: (change) => {
         session.fileChanges.push({
@@ -175,10 +200,16 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
   const printHelp = buildHelpPrinter();
 
   let shouldExit = false;
+  // Collect tool descriptions for /stats token estimation.
+  const toolDescriptions = Object.values(tools)
+    .map((t) => (t as { description?: string }).description ?? "")
+    .filter(Boolean);
+
   const slashCtx = {
     session,
     approvals,
     printHelp,
+    toolDescriptions,
     setShouldExit: () => {
       shouldExit = true;
     },
@@ -241,16 +272,23 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
 
     session.turn += 1;
     session.messages.push({ role: "user", content: expanded });
+    // Reset per-turn file tracking.
+    viewedFiles.clear();
+    editedFiles.clear();
 
     try {
+      startLoader("Thinking...");
       const result = streamText({
         model: session.languageModel,
         system: buildSystemPrompt(session),
         messages: trimMessagesForSending(session.messages),
         tools,
-        stopWhen: stepCountIs(20),
+        // Cap steps per mode: autopilot gets more room, ask/plan are tighter
+        // to prevent runaway exploration on vague questions.
+        stopWhen: stepCountIs(2000),
       });
 
+      stopLoader();
       stdout.write(kleur.green("● "));
       let assistantText = "";
       for await (const part of result.fullStream) {
@@ -260,6 +298,7 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
         } else if (part.type === "tool-call") {
           const inputSummary = toolInputSummary(part.toolName, part.input);
           stdout.write("\n" + kleur.dim(`  → ${part.toolName}${inputSummary ? ": " + inputSummary : ""}`) + "\n");
+          startLoader(`Running ${part.toolName}...`);
           await runHooks(session.hooks, "preToolUse", {
             toolName: part.toolName,
             input: part.input,
@@ -267,6 +306,7 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
             cwd: process.cwd(),
           });
         } else if (part.type === "tool-result") {
+          stopLoader();
           await runHooks(session.hooks, "postToolUse", {
             toolName: part.toolName,
             output: part.output,
@@ -274,6 +314,7 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
             cwd: process.cwd(),
           });
         } else if (part.type === "error") {
+          stopLoader();
           const message =
             part.error instanceof Error ? part.error.message : String(part.error);
           console.error("\n" + kleur.red("✗ Stream error:"), message);
@@ -290,6 +331,27 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
       session.cumulativeInputTokens += usage.inputTokens ?? 0;
       session.cumulativeOutputTokens += usage.outputTokens ?? 0;
 
+      // Per-turn token budget warning (>25k suggests context is being saturated quickly).
+      const WARN_TOKENS_PER_TURN = 25_000;
+      const turnTokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+      if (turnTokens > WARN_TOKENS_PER_TURN) {
+        console.log(
+          kleur.yellow(`⚠ This turn used ${turnTokens.toLocaleString()} tokens (>${WARN_TOKENS_PER_TURN.toLocaleString()} per-turn suggestion)`),
+        );
+        console.log(kleur.dim("  Consider being more specific, or run /compact to reduce context."));
+      }
+
+      // Show per-turn usage summary.
+      const contextSize = getModelContextSize(session.creds.provider, session.modelName);
+      const totalTokensUsed = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+      const usagePct = ((totalTokensUsed / contextSize) * 100).toFixed(1);
+      stdout.write(
+        kleur.dim(
+          `[turn: ${(usage.inputTokens ?? 0).toLocaleString()} in / ${(usage.outputTokens ?? 0).toLocaleString()} out · cumulative: ${totalTokensUsed.toLocaleString()}/${Math.round(contextSize / 1_000)}k (${usagePct}%)]\n`,
+        ),
+      );
+      stdout.write("\n");
+
       await saveSession({
         id: session.id,
         name: session.name,
@@ -303,11 +365,10 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
         cumulativeOutputTokens: session.cumulativeOutputTokens,
       });
 
-      // Auto-compact when approaching context window cap (at 90%).
-      const totalTokensUsed = session.cumulativeInputTokens + session.cumulativeOutputTokens;
-      // Use a safe default of 180k tokens if we can't determine context size
-      if (totalTokensUsed > 180_000) {
-        console.log(kleur.dim("Context approaching limit — auto-compacting…"));
+      // Auto-compact when approaching 85% of the model's actual context window.
+      const autoCompactThreshold = Math.floor(contextSize * 0.85);
+      if (totalTokensUsed > autoCompactThreshold) {
+        console.log(kleur.dim(`Context at ${usagePct}% — auto-compacting…`));
         await runAutoCompact(session);
       }
     } catch (err) {
@@ -327,6 +388,18 @@ function promptString(session: Session): string {
   if (session.mode === "autopilot") modeTag = kleur.red("[auto] ");
   else if (session.mode === "plan") modeTag = kleur.yellow("[plan] ");
   return modeTag + kleur.cyan("› ");
+}
+
+function printLogo(): void {
+  const logo = `
+  ███╗   ██╗██╗      ██████╗ ██████╗ ██████╗ ██╗██╗      ██████╗ ████████╗
+  ████╗  ██║██║     ██╔════╝██╔═══██╗██╔══██╗██║██║     ██╔═══██╗╚══██╔══╝
+  ██╔██╗ ██║██║     ██║     ██║   ██║██████╔╝██║██║     ██║   ██║   ██║
+  ██║╚██╗██║██║     ██║     ██║   ██║██╔═══╝ ██║██║     ██║   ██║   ██║
+  ██║ ╚████║███████╗╚██████╗╚██████╔╝██║     ██║███████╗╚██████╔╝   ██║
+  ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝ ╚═════╝    ╚═╝
+  `;
+  console.log(kleur.cyan(logo));
 }
 
 function printBanner(session: Session): void {

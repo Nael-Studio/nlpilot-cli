@@ -20,6 +20,7 @@ import {
 } from "../persistence.ts";
 import { loadEffectiveMcpConfig, mergeAdditionalMcpConfig } from "../mcp.ts";
 import { startMcpRuntime } from "../tools/mcp.ts";
+import { startLoader, stopLoader, stopLoaderWithMessage } from "../ui/loader.ts";
 
 export type OutputFormat = "text" | "json";
 
@@ -113,6 +114,8 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   const tools = buildTools({
     approvals,
     prompt: promptFn,
+    viewedFiles: new Set<string>(),
+    editedFiles: new Set<string>(),
     recorder: {
       record: (change) => {
         session.fileChanges.push({
@@ -137,6 +140,9 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   const isSilent = opts.silent ?? false;
 
   try {
+    if (!isJson && !isSilent) {
+      startLoader("Thinking...");
+    }
     const result = streamText({
       model: session.languageModel,
       system: buildSystemPrompt(session),
@@ -148,6 +154,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     let assistantText = "";
     for await (const part of result.fullStream) {
       if (part.type === "text-delta") {
+        if (!isJson && !isSilent) stopLoader();
         assistantText += part.text;
         if (isJson) {
           emitJson({ type: "text", data: part.text });
@@ -161,9 +168,12 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
             data: { toolName: part.toolName, input: part.input },
           });
         } else if (!isSilent) {
+          stopLoader();
           process.stderr.write(`\n  → ${part.toolName}\n`);
+          startLoader(`Running ${part.toolName}...`);
         }
       } else if (part.type === "tool-result") {
+        if (!isJson && !isSilent) stopLoader();
         if (isJson) {
           emitJson({
             type: "tool-result",
@@ -171,6 +181,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
           });
         }
       } else if (part.type === "error") {
+        stopLoader();
         let message: string;
         if (part.error instanceof Error) message = part.error.message;
         else if (typeof part.error === "object" && part.error !== null)

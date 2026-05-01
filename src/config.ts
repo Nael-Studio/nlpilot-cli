@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { mkdir, readFile, writeFile, chmod, unlink, stat } from "node:fs/promises";
 import { getModelCatalog, initializeModelCatalog } from "./models.ts";
 
-export type Provider = "openai" | "anthropic" | "google";
+export type Provider = "openai" | "anthropic" | "google" | "deepseek" | "moonshotai";
 
 export interface Credentials {
   provider: Provider;
@@ -27,6 +27,8 @@ export function getDefaultModels(): Record<Provider, string> {
     openai: catalog.openai[0]?.id ?? "gpt-5.5",
     anthropic: catalog.anthropic[0]?.id ?? "claude-opus-4.7",
     google: catalog.google[0]?.id ?? "gemini-2.5-pro",
+    deepseek: catalog.deepseek?.[0]?.id ?? "deepseek-v4-pro",
+    moonshotai: catalog.moonshotai?.[0]?.id ?? "kimi-k2.6",
   };
 }
 

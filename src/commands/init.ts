@@ -5,6 +5,7 @@ import kleur from "kleur";
 import { generateText } from "ai";
 import { resolveCredentials, DEFAULT_MODELS } from "../config.ts";
 import { getModel } from "../providers.ts";
+import { startLoader, stopLoader } from "../ui/loader.ts";
 
 const NLPILOT_DIR = ".nlpilot";
 const INSTRUCTIONS_FILE = "instructions.md";

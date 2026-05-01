@@ -1,5 +1,6 @@
 import { createGateway } from "@ai-sdk/gateway";
 import { createAnthropic } from "@ai-sdk/anthropic";
+import { createOpenAI } from "@ai-sdk/openai";
 import type { LanguageModel } from "ai";
 import type { Credentials, Provider } from "./config.ts";
 import { DEFAULT_MODELS } from "./config.ts";
@@ -30,13 +31,13 @@ export function getModel(creds: Credentials, modelOverride?: string): LanguageMo
       });
       return client(modelName);
     }
-    // For other providers with custom baseUrl, fall back to gateway
-    // (which may not work perfectly but provides a fallback)
-    const gateway = createGateway({ apiKey: creds.apiKey });
-    const qualified = modelName.includes("/")
-      ? modelName
-      : `${inferProvider(modelName, creds.provider)}/${modelName}`;
-    return gateway(qualified);
+    // OpenAI-compatible endpoint (Azure Foundry, etc.) — use baseUrl directly
+    // so prompt caching and Azure-specific headers work correctly.
+    const client = createOpenAI({
+      apiKey: creds.apiKey,
+      baseURL: creds.baseUrl,
+    });
+    return client(modelName);
   }
 
   // Use gateway for standard endpoints

@@ -5,6 +5,15 @@ import type { LanguageModel } from "ai";
 import type { Credentials, Provider } from "./config.ts";
 import { DEFAULT_MODELS } from "./config.ts";
 
+/** Human-readable display labels for each provider. */
+export const PROVIDER_LABELS: Record<Provider, string> = {
+  openai: "OpenAI",
+  anthropic: "Anthropic",
+  google: "Google",
+  deepseek: "DeepSeek",
+  moonshotai: "Moonshot AI",
+};
+
 /** Infer the provider from a model name prefix when no slash qualifier is present. */
 function inferProvider(modelName: string, fallback: Provider): Provider {
   if (modelName.startsWith("gpt-") || modelName.startsWith("o1") || modelName.startsWith("o3")) {
@@ -64,4 +73,6 @@ export function getModel(creds: Credentials, modelOverride?: string): LanguageMo
   // routes to openai regardless of which provider is stored in credentials).
   const qualified = modelName.includes("/")
     ? modelName
-    : `${inferProvider
+    : `${inferProvider(modelName, creds.provider)}/${modelName}`;
+  return gateway.languageModel(qualified);
+}

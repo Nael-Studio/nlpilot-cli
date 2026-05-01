@@ -73,7 +73,7 @@ The API key and base URL are stored together in the credentials file. When a `ba
 ```bash
 nlpilot                     # start a fresh session
 nlpilot --continue          # resume the most recent session
-nlpilot --model claude-sonnet-4-6
+nlpilot --model claude-sonnet-4.6
 ```
 
 ### One-shot (non-interactive)
@@ -275,7 +275,7 @@ Define lifecycle hooks in `.nlpilot/hooks.json` to run shell scripts before/afte
 ### Anthropic
 | Model ID | Description |
 |---|---|
-| `claude-sonnet-4-6` | Balanced flagship · 1M ctx |
+| `claude-sonnet-4.6` | Balanced flagship · 1M ctx |
 | `claude-opus-4-7` | Top quality · 1M ctx |
 | `claude-haiku-4-5` | Fast & cheap · 200K ctx |
 | `claude-opus-4-6` | High quality · 1M ctx |

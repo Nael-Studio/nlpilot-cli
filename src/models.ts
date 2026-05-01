@@ -71,7 +71,7 @@ export const MODEL_CATALOG: Record<Provider, ModelOption[]> = {
       description: "Top quality · 1M ctx · 70tps · $5/$25 per M",
     },
     {
-      id: "claude-sonnet-4-6",
+      id: "claude-sonnet-4.6",
       label: "claude-sonnet-4.6",
       description: "Balanced flagship · 1M ctx · 54tps · $3/$15 per M",
     },

@@ -1,29 +1,30 @@
 import kleur from "kleur";
 import { resolveCredentials, type Provider } from "../config.ts";
-import { MODEL_CATALOG } from "../models.ts";
+import { getModelCatalog } from "../models.ts";
 import { PROVIDER_LABELS } from "../providers.ts";
 
-const ALL_PROVIDERS = Object.keys(MODEL_CATALOG) as Provider[];
+const VALID_PROVIDERS: Provider[] = ["openai", "anthropic", "google"];
 
 function isProvider(value: string): value is Provider {
-  return (ALL_PROVIDERS as string[]).includes(value);
+  return VALID_PROVIDERS.includes(value as Provider);
 }
 
 export async function modelsCommand(providerArg?: string): Promise<void> {
+  const modelCatalog = getModelCatalog();
   let providers: Provider[];
 
   if (providerArg) {
     if (!isProvider(providerArg)) {
       console.error(
         kleur.red("✗"),
-        `Unknown provider "${providerArg}". Expected one of: ${ALL_PROVIDERS.join(", ")}`,
+        `Unknown provider "${providerArg}". Expected one of: ${VALID_PROVIDERS.join(", ")}`,
       );
       process.exitCode = 1;
       return;
     }
     providers = [providerArg];
   } else {
-    providers = ALL_PROVIDERS;
+    providers = VALID_PROVIDERS;
   }
 
   const creds = await resolveCredentials();
@@ -32,7 +33,7 @@ export async function modelsCommand(providerArg?: string): Promise<void> {
 
   for (const p of providers) {
     console.log(kleur.bold().magenta(PROVIDER_LABELS[p]));
-    for (const m of MODEL_CATALOG[p]) {
+    for (const m of modelCatalog[p]) {
       const isActive = p === activeProvider && m.id === activeModel;
       const marker = isActive ? kleur.green("●") : " ";
       const label = isActive ? kleur.bold(m.label) : m.label;

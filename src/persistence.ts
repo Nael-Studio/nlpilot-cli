@@ -15,6 +15,8 @@ export interface PersistedSession {
   updatedAt: number;
   createdAt: number;
   messages: ModelMessage[];
+  cumulativeInputTokens?: number; // Optional for backwards compatibility
+  cumulativeOutputTokens?: number; // Optional for backwards compatibility
 }
 
 function cwdHash(cwd: string): string {

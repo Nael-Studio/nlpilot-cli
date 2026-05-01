@@ -11,6 +11,7 @@ import { buildTools } from "../tools/index.ts";
 import { createApprovalState } from "../tools/approval.ts";
 import {
   buildSystemPrompt,
+  trimMessagesForSending,
   loadCustomization,
   type Session,
 } from "../session.ts";
@@ -33,6 +34,33 @@ interface ReplOptions {
   deny?: string[];
 }
 
+/** Returns a short human-readable summary of tool inputs for display. */
+function toolInputSummary(toolName: string, input: Record<string, unknown>): string {
+  switch (toolName) {
+    case "bash":
+      return typeof input.command === "string" ? input.command : "";
+    case "view":
+    case "edit":
+    case "create": {
+      const p = typeof input.path === "string" ? input.path : "";
+      const range =
+        input.startLine != null
+          ? ` (lines ${input.startLine}–${input.endLine ?? "…"})`
+          : "";
+      return p + range;
+    }
+    case "grep": {
+      const pattern = typeof input.pattern === "string" ? input.pattern : "";
+      const glob = typeof input.glob === "string" ? ` in ${input.glob}` : "";
+      return `"${pattern}"${glob}`;
+    }
+    case "glob":
+      return typeof input.pattern === "string" ? input.pattern : "";
+    default:
+      return "";
+  }
+}
+
 export async function startRepl(options: ReplOptions = {}): Promise<void> {
   const creds = await resolveCredentials();
   if (!creds) {
@@ -52,6 +80,8 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
   let priorId: string | undefined;
   let priorName: string | undefined;
   let priorCreatedAt: number | undefined;
+  let priorInputTokens = 0;
+  let priorOutputTokens = 0;
   if (options.continueSession) {
     const prior = await loadMostRecentSession();
     if (prior) {
@@ -59,6 +89,8 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
       priorId = prior.id;
       priorName = prior.name;
       priorCreatedAt = prior.createdAt;
+      priorInputTokens = prior.cumulativeInputTokens ?? 0;
+      priorOutputTokens = prior.cumulativeOutputTokens ?? 0;
       console.log(
         kleur.dim(`Restored ${prior.messages.length} messages from session ${prior.name ?? prior.id}.`),
       );
@@ -83,6 +115,8 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
     agents: customization.agents,
     skills: customization.skills,
     hooks: customization.hooks,
+    cumulativeInputTokens: priorInputTokens,
+    cumulativeOutputTokens: priorOutputTokens,
   };
 
   await runHooks(session.hooks, "sessionStart", { sessionId: session.id, cwd: process.cwd() });
@@ -96,7 +130,21 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
     allow: options.allow,
     deny: options.deny,
   });
-  const promptFn = (q: string): Promise<string> => rl.question(q);
+  // Approval prompts must NOT share the REPL's readline instance — tool execute
+  // functions run DURING stream iteration and sharing rl would deadlock Bun's
+  // readline. Use a separate interface that closes immediately after each prompt.
+  // After closing, stdin.resume() is required because readline.close() pauses stdin,
+  // which would leave the main rl unable to receive further input.
+  const promptFn = (q: string): Promise<string> =>
+    new Promise((resolve) => {
+      const approvalRl = readline.createInterface({ input: stdin, output: stdout, terminal: false });
+      stdout.write(q);
+      approvalRl.once("line", (answer) => {
+        approvalRl.close();
+        stdin.resume();
+        resolve(answer);
+      });
+    });
   const tools = buildTools({
     approvals,
     prompt: promptFn,
@@ -198,7 +246,7 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
       const result = streamText({
         model: session.languageModel,
         system: buildSystemPrompt(session),
-        messages: session.messages,
+        messages: trimMessagesForSending(session.messages),
         tools,
         stopWhen: stepCountIs(20),
       });
@@ -210,7 +258,8 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
           assistantText += part.text;
           stdout.write(part.text);
         } else if (part.type === "tool-call") {
-          stdout.write("\n" + kleur.dim(`  → ${part.toolName}`) + "\n");
+          const inputSummary = toolInputSummary(part.toolName, part.input);
+          stdout.write("\n" + kleur.dim(`  → ${part.toolName}${inputSummary ? ": " + inputSummary : ""}`) + "\n");
           await runHooks(session.hooks, "preToolUse", {
             toolName: part.toolName,
             input: part.input,
@@ -233,8 +282,13 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
       stdout.write("\n\n");
 
       session.lastAssistantText = assistantText;
-      const responseMessages = (await result.response).messages;
+      const [response, usage] = await Promise.all([result.response, result.totalUsage]);
+      const responseMessages = response.messages;
       session.messages.push(...responseMessages);
+
+      // Capture actual token usage from Vercel AI SDK
+      session.cumulativeInputTokens += usage.inputTokens ?? 0;
+      session.cumulativeOutputTokens += usage.outputTokens ?? 0;
 
       await saveSession({
         id: session.id,
@@ -245,10 +299,14 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
         createdAt: session.createdAt,
         updatedAt: Date.now(),
         messages: session.messages,
+        cumulativeInputTokens: session.cumulativeInputTokens,
+        cumulativeOutputTokens: session.cumulativeOutputTokens,
       });
 
-      // Auto-compact when approaching context window cap.
-      if (estimateTokens(session.messages) > 180_000) {
+      // Auto-compact when approaching context window cap (at 90%).
+      const totalTokensUsed = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+      // Use a safe default of 180k tokens if we can't determine context size
+      if (totalTokensUsed > 180_000) {
         console.log(kleur.dim("Context approaching limit — auto-compacting…"));
         await runAutoCompact(session);
       }

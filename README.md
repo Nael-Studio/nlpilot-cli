@@ -116,7 +116,7 @@ Inside an interactive session, type `/` to access built-in commands:
 | `/clear` | `/new`, `/reset` | Start a new conversation (clears history) |
 | `/model [id]` | `/models` | List available models, or switch to a specific model |
 | `/mode [ask\|plan\|autopilot]` | | Show or change the tool approval mode |
-| `/compact` | | Summarise conversation history to save context tokens |
+| `/compact` | | Summarise conversation history to save context tokens (resets cumulative token count) |
 | `/save [name]` | | Save the current session with an optional name |
 | `/sessions` | `/history` | List all saved sessions |
 | `/load <id>` | | Load a session by ID |
@@ -211,10 +211,40 @@ Sessions are stored under `~/.nlpilot/sessions/<cwdHash>/` and are shared betwee
 - Conversation messages
 - Model and provider used
 - File changes made by the agent during the session
+- Cumulative token counts (tracked across session resumption)
 
 ```bash
 nlpilot --continue    # resume the last session in the current directory
 ```
+
+### Context Optimization
+
+nlpilot automatically manages context window usage through several techniques:
+
+#### Message Trimming
+Large tool outputs (like verbose file reads or bash results) are automatically compressed in the conversation history:
+- Kept in full: Last 3 assistant turns (to preserve recent context)
+- Trimmed: Older outputs larger than 800 characters are replaced with `[output trimmed — X chars]`
+- Benefit: Preserves context window space while retaining relevant recent interactions
+
+#### Output Limits
+To prevent single tool calls from consuming too much context:
+- **Bash output** limited to 8,000 characters
+- **File viewing** limited to 80 default lines or 6,000 bytes
+- **Automatic abbreviation**: Tool outputs exceeding limits are truncated with a note
+
+#### Auto-Compaction
+When the conversation history grows very large, use `/compact` to summarize the entire conversation:
+- Creates a compressed summary of the discussion (counted toward cumulative tokens)
+- Resets cumulative token tracking to reflect the new baseline
+- Useful for long-running sessions to free up context window
+
+#### Cumulative Token Tracking
+Sessions track cumulative input and output tokens across all turns:
+- `cumulativeInputTokens`: Total tokens sent to the model
+- `cumulativeOutputTokens`: Total tokens received from the model
+- Reset only after `/compact` to reflect the summarization
+- Accessible in session metadata for cost estimation
 
 ---
 
@@ -266,6 +296,77 @@ Define lifecycle hooks in `.nlpilot/hooks.json` to run shell scripts before/afte
   "preTurn": ["./scripts/lint.sh"],
   "postTurn": ["./scripts/format.sh"]
 }
+```
+
+---
+
+## Model Catalog Configuration
+
+nlpilot uses a flexible model catalog system that combines built-in defaults with user customization.
+
+### Catalog Location
+
+The model catalog is loaded from (in priority order):
+1. **User catalog**: `~/.nlpilot/models.json` (if exists)
+2. **Fallback**: Built-in embedded catalog (automatically used if file missing or invalid)
+
+### Catalog File Format
+
+Create or edit `~/.nlpilot/models.json` to customize available models:
+
+```json
+{
+  "anthropic": [
+    {
+      "id": "claude-sonnet-4.6",
+      "name": "Claude Sonnet 4.6",
+      "description": "Balanced flagship model",
+      "contextSize": 1000000,
+      "inputCost": 0.003,
+      "outputCost": 0.015
+    }
+  ],
+  "openai": [
+    {
+      "id": "gpt-5.4",
+      "name": "GPT-5.4",
+      "description": "Balanced model",
+      "contextSize": 1100000,
+      "inputCost": 0.005,
+      "outputCost": 0.020
+    }
+  ],
+  "google": [
+    {
+      "id": "gemini-2.5-pro",
+      "name": "Gemini 2.5 Pro",
+      "description": "Advanced reasoning model",
+      "contextSize": 1000000,
+      "inputCost": 0.0025,
+      "outputCost": 0.01
+    }
+  ]
+}
+```
+
+### Catalog Schema
+
+Each model entry supports:
+- **id** (required): Unique model identifier
+- **name**: Display name
+- **description**: Brief description
+- **contextSize**: Maximum context window in tokens (used for planning and message trimming)
+- **inputCost**: Cost per 1M input tokens (optional, for future billing features)
+- **outputCost**: Cost per 1M output tokens (optional, for future billing features)
+
+### Default Model Selection
+
+During `nlpilot login`, you'll select a default model from the available catalog. This default is used whenever no `--model` flag is provided.
+
+To change your default model later:
+```bash
+nlpilot login          # Re-run the wizard to select a different model
+nlpilot --model <id>   # Override for a single run
 ```
 
 ---
@@ -331,6 +432,36 @@ src/
     ├── approval.ts       # Tool approval state machine
     └── mcp.ts            # MCP runtime (connect + expose as AI SDK tools)
 ```
+
+---
+
+## Changelog
+
+### v0.x (Latest)
+
+#### Context Management & Optimization
+- **Automatic message trimming**: Large tool outputs in conversation history are now automatically compressed to preserve context window. Recent assistant turns retain full context, while older verbose outputs are replaced with `[output trimmed — X chars]` notation.
+- **Output limits**: Reduced default output sizes to optimize context usage:
+  - Bash command output capped at 8,000 characters
+  - File viewing limited to 80 lines or 6,000 bytes (configurable via `VIEW_DEFAULT_LINES` and `VIEW_MAX_BYTES`)
+- **Cumulative token tracking**: Sessions now track total input/output tokens across all turns and resumptions
+- **Auto-compaction token reset**: When `/compact` summarizes a conversation, cumulative token counts reset to reflect the new baseline
+
+#### Model Catalog System
+- **Dynamic model loading**: Model catalog now loads from `~/.nlpilot/models.json` with automatic fallback to embedded defaults
+- **User customization**: Create or modify `~/.nlpilot/models.json` to add custom models, adjust costs, and override model configurations
+- **Context size awareness**: Models now include `contextSize` property for better context planning and message trimming decisions
+- **Dynamic default selection**: Default models are determined from the loaded catalog rather than hardcoded
+
+#### Tool & Approval System
+- **Fixed readline deadlock**: Improved REPL approval prompt handling with separate readline instances and mutex-based serialization
+- **Better tool logging**: New `toolInputSummary()` function provides cleaner display of tool execution details (bash commands, file paths with line ranges, grep patterns)
+- **Concurrent prompt protection**: Mutex-based `_promptLock` prevents concurrent approval dialogs from interfering
+
+#### Configuration & Startup
+- **Auto-initialization**: Config directory is now automatically initialized on first run
+- **Early catalog loading**: Model catalog pre-loaded during app startup for better initialization flow
+- **Separation of concerns**: Config file handles credentials; model catalog handles model definitions
 
 ---
 

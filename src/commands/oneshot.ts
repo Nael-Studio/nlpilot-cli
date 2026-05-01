@@ -9,6 +9,7 @@ import {
 } from "../tools/approval.ts";
 import {
   buildSystemPrompt,
+  trimMessagesForSending,
   loadCustomization,
   type Session,
 } from "../session.ts";
@@ -95,6 +96,8 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     hooks: customization.hooks,
     enableReasoningSummaries: opts.enableReasoningSummaries,
     additionalMcpConfig: opts.additionalMcpConfig,
+    cumulativeInputTokens: 0,
+    cumulativeOutputTokens: 0,
   };
 
   const approvals: ApprovalState = createApprovalState({
@@ -137,7 +140,7 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     const result = streamText({
       model: session.languageModel,
       system: buildSystemPrompt(session),
-      messages: session.messages,
+      messages: trimMessagesForSending(session.messages),
       tools,
       stopWhen: stepCountIs(20),
     });

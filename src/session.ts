@@ -1,4 +1,4 @@
-import type { LanguageModel, ModelMessage } from "ai";
+import type { LanguageModel, ModelMessage, ToolResultPart } from "ai";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Credentials } from "./config.ts";
@@ -36,6 +36,8 @@ export interface Session {
   hooks: HooksConfig;
   enableReasoningSummaries?: boolean;
   additionalMcpConfig?: string;
+  cumulativeInputTokens: number; // Actual tokens from API
+  cumulativeOutputTokens: number; // Actual tokens from API
 }
 
 export interface LoadedInstruction {
@@ -80,6 +82,48 @@ export async function loadCustomization(cwd: string = process.cwd()): Promise<{
     loadHooks(cwd),
   ]);
   return { instructions, agents, skills, hooks };
+}
+
+/**
+ * Returns a copy of messages with large tool results from older turns compressed.
+ * Keeps the last `keepFullTurns` assistant turns intact; trims earlier tool results
+ * that exceed `maxResultChars` to a short stub. This prevents verbose file reads
+ * and bash output from ballooning the context on every subsequent turn.
+ */
+export function trimMessagesForSending(
+  messages: ModelMessage[],
+  keepFullTurns = 3,
+  maxResultChars = 800,
+): ModelMessage[] {
+  // Count assistant turns from the end to find the cutoff index
+  let assistantTurnsSeen = 0;
+  let cutoffIndex = messages.length; // everything before this index gets trimmed
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "assistant") {
+      assistantTurnsSeen++;
+      if (assistantTurnsSeen >= keepFullTurns) {
+        cutoffIndex = i;
+        break;
+      }
+    }
+  }
+
+  return messages.map((msg, idx) => {
+    if (idx >= cutoffIndex) return msg; // keep recent messages intact
+    if (msg.role !== "tool") return msg; // only compress tool result messages
+
+    const parts = msg.content as ToolResultPart[];
+    const compressedParts = parts.map((part) => {
+      const resultStr =
+        typeof part.output === "string" ? part.output : JSON.stringify(part.output);
+      if (resultStr.length <= maxResultChars) return part;
+      return {
+        ...part,
+        output: { type: "text" as const, value: `[output trimmed — ${resultStr.length} chars]` },
+      };
+    });
+    return { ...msg, content: compressedParts };
+  });
 }
 
 export function buildSystemPrompt(session: Session): string {

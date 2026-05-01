@@ -32,6 +32,10 @@ export async function runAutoCompact(session: Session): Promise<void> {
       { role: "user", content: `Summary of prior conversation:\n${summary}` },
       { role: "assistant", content: "Acknowledged. Continuing from this summary." },
     ];
+    // Reset cumulative token counts to reflect the compacted state.
+    // Use the actual usage from the summarization call as the new baseline.
+    session.cumulativeInputTokens = result.usage.inputTokens ?? 0;
+    session.cumulativeOutputTokens = result.usage.outputTokens ?? 0;
     console.log(kleur.green("✓"), "Auto-compacted conversation");
   } catch (err) {
     console.error(

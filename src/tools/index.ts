@@ -16,9 +16,9 @@ export interface FileChangeRecorder {
   record: (change: Omit<FileChange, "turn" | "timestamp">) => void;
 }
 
-const MAX_OUTPUT = 32_000;
-const VIEW_DEFAULT_LINES = 200;
-const VIEW_MAX_BYTES = 16_000;
+const MAX_OUTPUT = 8_000;   // bash stdout/stderr cap per call
+const VIEW_DEFAULT_LINES = 80;  // default lines returned by view (no range given)
+const VIEW_MAX_BYTES = 6_000;   // hard byte cap on view output
 
 const REGEX_META = new RegExp(String.raw`[.*+?^${"$"}{}()|[\]\\]`, "g");
 

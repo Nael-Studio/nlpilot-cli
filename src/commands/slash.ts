@@ -19,6 +19,10 @@ import {
   renameSession,
 } from "../persistence.ts";
 import { initCommand } from "./init.ts";
+import {
+  getContextStats,
+  formatContextStats,
+} from "../telemetry/TokenTracker.ts";
 
 export interface SlashContext {
   session: Session;
@@ -111,17 +115,39 @@ const COMMANDS: SlashSpec[] = [
   },
   {
     names: ["context"],
-    description: "Show approximate token window usage",
+    description: "Show context window usage and token statistics",
     handler: ({ session }) => {
-      const text = session.messages
-        .map((m) =>
-          typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-        )
-        .join("\n");
-      const approxTokens = Math.ceil(text.length / 4);
-      console.log(
-        `${kleur.bold("Messages:")} ${session.messages.length}  ${kleur.bold("~tokens:")} ${approxTokens}`,
+      // Extract provider from credentials
+      const provider = session.creds.provider;
+      const modelId = session.modelName;
+      
+      const stats = getContextStats(
+        session.cumulativeInputTokens,
+        session.cumulativeOutputTokens,
+        provider,
+        modelId,
+        true, // isActual = true, we're using real API counts
       );
+      
+      console.log();
+      console.log(kleur.bold("Context Window Status"));
+      console.log(kleur.dim("─".repeat(40)));
+      console.log(`Model: ${kleur.cyan(modelId)}`);
+      console.log(`Messages: ${session.messages.length}`);
+      console.log(formatContextStats(stats));
+      
+      if (stats.isApproachingLimit && stats.contextSize) {
+        console.log();
+        console.log(
+          kleur.yellow("⚠ Approaching context limit!"),
+        );
+        console.log(
+          kleur.dim(
+            `Use /compact to reduce conversation size, or switch to a model with larger context window.`,
+          ),
+        );
+      }
+      console.log();
     },
   },
   {
@@ -262,6 +288,9 @@ const COMMANDS: SlashSpec[] = [
             content: "Acknowledged. Continuing from this summary.",
           },
         ];
+        // Reset cumulative token counts to reflect the compacted state.
+        session.cumulativeInputTokens = result.usage.inputTokens ?? 0;
+        session.cumulativeOutputTokens = result.usage.outputTokens ?? 0;
         console.log(kleur.green("✓"), "Conversation compacted");
       } catch (err) {
         console.error(

@@ -10,6 +10,7 @@ import { modelsCommand } from "./commands/models.ts";
 import { runOneShot, type OutputFormat } from "./commands/oneshot.ts";
 import { initCommand } from "./commands/init.ts";
 import { mcpCommand } from "./commands/mcp.ts";
+import { ensureConfigDir } from "./config.ts";
 
 interface RootOptions {
   model?: string;
@@ -151,6 +152,9 @@ function formatError(err: unknown): string {
 }
 
 try {
+  // Initialize config directory and load models catalog
+  await ensureConfigDir();
+  
   await program.parseAsync(process.argv);
 } catch (err: unknown) {
   console.error(kleur.red("✗"), formatError(err));

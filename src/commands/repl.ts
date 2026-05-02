@@ -9,6 +9,7 @@ import kleur from "kleur";
 import { resolveCredentials, DEFAULT_MODELS } from "../config.ts";
 import { getModel, PROVIDER_LABELS } from "../providers.ts";
 import { getModelContextSize } from "../models.ts";
+import { resolveRoutedModel } from "../model-router.ts";
 import { buildTools } from "../tools/index.ts";
 import { createApprovalState } from "../tools/approval.ts";
 import {
@@ -24,8 +25,14 @@ import {
   saveSession,
 } from "../persistence.ts";
 import { runHooks } from "../hooks.ts";
-import { runAutoCompact, estimateTokens } from "./compact.ts";
-import { loadEffectiveMcpConfig, loadProjectMcpConfig, getProjectMcpConfigPath } from "../mcp.ts";
+import { runAutoCompact, runRollingCompact } from "./compact.ts";
+import {
+  loadEffectiveMcpConfig,
+  loadProjectMcpConfig,
+  getProjectMcpConfigPath,
+  type MCPConfig,
+  type MCPServer,
+} from "../mcp.ts";
 import { startMcpRuntime } from "../tools/mcp.ts";
 import { startLoader, stopLoader, stopLoaderWithMessage } from "../ui/loader.ts";
 
@@ -35,6 +42,134 @@ interface ReplOptions {
   allowAll?: boolean;
   allow?: string[];
   deny?: string[];
+  maxSteps?: number;
+  maxOutputTokens?: number;
+  mcp?: boolean;
+  compactThreshold?: number;
+  modelRouting?: boolean;
+  autoCompact?: boolean;
+}
+
+const PROMPT_SOURCE_FILE_LIMIT = 60;
+const SOURCE_SCAN_LIMIT = 800;
+const DIRECTORY_SUMMARY_LIMIT = 40;
+
+function stepLimitForMode(mode: Session["mode"], override?: number): number {
+  if (override != null) return override;
+  return mode === "autopilot" ? 100 : 50;
+}
+
+function promptFilePriority(file: string): number {
+  if (
+    file === "package.json" ||
+    file === "tsconfig.json" ||
+    file === "README.md" ||
+    file === "AGENTS.md" ||
+    file === "INSTRUCTIONS.md" ||
+    file.startsWith(".nlpilot/")
+  ) {
+    return 0;
+  }
+  if (file.startsWith("src/")) return 10;
+  if (file.endsWith(".ts") || file.endsWith(".tsx")) return 20;
+  if (file.endsWith(".js") || file.endsWith(".jsx") || file.endsWith(".mjs")) return 30;
+  if (file.startsWith("docs/")) return 40;
+  if (file.endsWith(".md")) return 50;
+  if (file.endsWith(".json")) return 60;
+  return 100;
+}
+
+function selectPromptSourceFiles(files: string[]): {
+  files: string[];
+  summary: string[];
+  omitted: number;
+} {
+  const summary = summarizeSourceDirectories(files);
+  const selected = [...files]
+    .sort((a, b) => {
+      const score = promptFilePriority(a) - promptFilePriority(b);
+      if (score !== 0) return score;
+      return a.localeCompare(b);
+    })
+    .slice(0, PROMPT_SOURCE_FILE_LIMIT)
+    .sort();
+  return {
+    files: selected,
+    summary,
+    omitted: Math.max(0, files.length - selected.length),
+  };
+}
+
+function summarizeSourceDirectories(files: string[]): string[] {
+  const counts = new Map<string, number>();
+  for (const file of files) {
+    const parts = file.split("/");
+    const dir =
+      parts.length === 1
+        ? "."
+        : parts.length === 2
+          ? parts[0] ?? "."
+          : `${parts[0]}/${parts[1]}`;
+    counts.set(dir, (counts.get(dir) ?? 0) + 1);
+  }
+
+  return [...counts.entries()]
+    .sort((a, b) => {
+      const score = promptFilePriority(`${a[0]}/index.ts`) - promptFilePriority(`${b[0]}/index.ts`);
+      if (score !== 0) return score;
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return a[0].localeCompare(b[0]);
+    })
+    .slice(0, DIRECTORY_SUMMARY_LIMIT)
+    .map(([dir, count]) => `${dir}/ (${count})`);
+}
+
+interface ContextEstimate {
+  systemTokens: number;
+  messageTokens: number;
+  toolTokens: number;
+  totalTokens: number;
+}
+
+function estimateTextTokens(text: string): number {
+  return estimateCharTokens(text.length);
+}
+
+function estimateCharTokens(chars: number): number {
+  return Math.ceil(chars / 4);
+}
+
+function estimateMessageTokens(messages: Session["messages"]): number {
+  let chars = 0;
+  for (const message of messages) {
+    chars += typeof message.content === "string"
+      ? message.content.length
+      : JSON.stringify(message.content).length;
+  }
+  return estimateCharTokens(chars);
+}
+
+function estimateToolSchemaTokens(toolDescriptions: string[]): number {
+  const toolDescChars = toolDescriptions.reduce((sum, description) => {
+    return sum + description.length;
+  }, 0);
+  return estimateCharTokens(toolDescChars) + toolDescriptions.length * 150;
+}
+
+function estimateCurrentContext(
+  session: Session,
+  toolDescriptions: string[],
+  latestUserMessage?: string,
+): ContextEstimate {
+  const systemTokens = estimateTextTokens(buildSystemPrompt(session, { latestUserMessage }));
+  const messageTokens = estimateMessageTokens(trimMessagesForSending(session.messages));
+  const toolTokens = estimateToolSchemaTokens(toolDescriptions);
+  return {
+    systemTokens,
+    messageTokens,
+    toolTokens,
+    totalTokens: systemTokens + messageTokens + toolTokens,
+  };
 }
 
 /** Returns a short human-readable summary of tool inputs for display. */
@@ -78,6 +213,8 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
   }
 
   const modelName = options.model ?? creds.model ?? DEFAULT_MODELS[creds.provider];
+  const modelPinnedByRun = Boolean(options.model || process.env.NLPILOT_MODEL);
+  const autoModelRouting = options.modelRouting !== false && !modelPinnedByRun && !creds.baseUrl;
 
   let priorMessages: Session["messages"] = [];
   let priorId: string | undefined;
@@ -122,19 +259,21 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
     cumulativeOutputTokens: priorOutputTokens,
   };
 
-  // Pre-scan source files and inject into system prompt so the model never
-  // needs discovery tool calls (find/ls/glob) to know what files exist.
+  // Pre-scan a compact source-file snapshot. Keep it intentionally small:
+  // this text is sent on every REPL turn, so a complete tree becomes a token tax.
   try {
     const g = new Glob("**/*.{ts,tsx,js,jsx,mjs,mts,json,md}");
     const files: string[] = [];
     for await (const f of g.scan({ cwd: process.cwd(), onlyFiles: true })) {
       if (!f.includes("node_modules") && !f.includes(".git") && !f.startsWith("dist/")) {
         files.push(f);
-        if (files.length >= 300) break;
+        if (files.length >= SOURCE_SCAN_LIMIT) break;
       }
     }
-    files.sort();
-    session.sourceFiles = files;
+    const selected = selectPromptSourceFiles(files);
+    session.sourceFiles = selected.files;
+    session.sourceFileSummary = selected.summary;
+    session.sourceFilesOmitted = selected.omitted;
   } catch {
     // non-fatal — model can still use grep filenamesOnly
   }
@@ -143,7 +282,9 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
 
   printLogo();
   printBanner(session);
-  await announceProjectMcp();
+  if (options.mcp !== false) {
+    await announceProjectMcp();
+  }
 
   const rl = readline.createInterface({ input: stdin, output: stdout });
   const approvals = createApprovalState({
@@ -184,22 +325,36 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
     },
   });
 
-  // Bring up MCP runtime (global + project .mcp.json) and merge its tools.
-  const mcpConfig = await loadEffectiveMcpConfig();
-  const mcp = await startMcpRuntime(mcpConfig.servers);
-  Object.assign(tools, mcp.tools);
-  const mcpToolNames = Object.keys(mcp.tools);
-  if (mcpToolNames.length > 0) {
-    console.log(
-      kleur.dim(
-        `MCP tools available: ${mcpToolNames.join(", ")}`,
-      ),
-    );
+  let shutdownMcp = async (): Promise<void> => undefined;
+  if (options.mcp !== false) {
+    // Bring up MCP runtime. Project `.mcp.json` is repo-controlled, so it must
+    // be trusted before any server command is spawned.
+    const projectMcpConfig = await loadProjectMcpConfig();
+    const includeProjectMcp = await confirmProjectMcp(projectMcpConfig, promptFn);
+    const mcpConfig = await loadEffectiveMcpConfig(process.cwd(), {
+      includeProject: includeProjectMcp,
+    });
+    const mcp = await startMcpRuntime(mcpConfig.servers, {
+      approvals,
+      prompt: promptFn,
+    });
+    Object.assign(tools, mcp.tools);
+    shutdownMcp = mcp.shutdown;
+
+    const mcpToolNames = Object.keys(mcp.tools);
+    if (mcpToolNames.length > 0) {
+      console.log(
+        kleur.dim(
+          `MCP tools available: ${mcpToolNames.join(", ")}`,
+        ),
+      );
+    }
   }
 
   const printHelp = buildHelpPrinter();
 
   let shouldExit = false;
+  let modelPinned = false;
   // Collect tool descriptions for /stats token estimation.
   const toolDescriptions = Object.values(tools)
     .map((t) => (t as { description?: string }).description ?? "")
@@ -210,6 +365,9 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
     approvals,
     printHelp,
     toolDescriptions,
+    setModelPinned: () => {
+      modelPinned = true;
+    },
     setShouldExit: () => {
       shouldExit = true;
     },
@@ -222,7 +380,7 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
   };
 
   rl.on("SIGINT", () => {
-    void mcp.shutdown().finally(() => {
+    void shutdownMcp().finally(() => {
       cleanup();
       process.exit(0);
     });
@@ -275,17 +433,21 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
     // Reset per-turn file tracking.
     viewedFiles.clear();
     editedFiles.clear();
+    if (autoModelRouting && !modelPinned) {
+      applyModelRoute(session, expanded);
+    }
 
     try {
       startLoader("Thinking...");
+      const systemPrompt = buildSystemPrompt(session, { latestUserMessage: expanded });
       const result = streamText({
         model: session.languageModel,
-        system: buildSystemPrompt(session),
+        system: systemPrompt,
         messages: trimMessagesForSending(session.messages),
         tools,
-        // Cap steps per mode: autopilot gets more room, ask/plan are tighter
-        // to prevent runaway exploration on vague questions.
-        stopWhen: stepCountIs(2000),
+        // Cap steps per mode to prevent runaway tool loops and cost surprises.
+        stopWhen: stepCountIs(stepLimitForMode(session.mode, options.maxSteps)),
+        maxOutputTokens: options.maxOutputTokens,
       });
 
       stopLoader();
@@ -343,14 +505,34 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
 
       // Show per-turn usage summary.
       const contextSize = getModelContextSize(session.creds.provider, session.modelName);
-      const totalTokensUsed = session.cumulativeInputTokens + session.cumulativeOutputTokens;
-      const usagePct = ((totalTokensUsed / contextSize) * 100).toFixed(1);
+      const cumulativeTokensUsed = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+      const contextEstimate = estimateCurrentContext(session, toolDescriptions, expanded);
+      const contextPct = ((contextEstimate.totalTokens / contextSize) * 100).toFixed(1);
       stdout.write(
         kleur.dim(
-          `[turn: ${(usage.inputTokens ?? 0).toLocaleString()} in / ${(usage.outputTokens ?? 0).toLocaleString()} out · cumulative: ${totalTokensUsed.toLocaleString()}/${Math.round(contextSize / 1_000)}k (${usagePct}%)]\n`,
+          `[turn: ${(usage.inputTokens ?? 0).toLocaleString()} in / ${(usage.outputTokens ?? 0).toLocaleString()} out · context est: ${contextEstimate.totalTokens.toLocaleString()}/${Math.round(contextSize / 1_000)}k (${contextPct}%) · cumulative API: ${cumulativeTokensUsed.toLocaleString()}]\n`,
         ),
       );
       stdout.write("\n");
+
+      let compacted = false;
+      if (options.autoCompact !== false) {
+        compacted = await runRollingCompact(session, 1);
+      }
+
+      // Rolling compaction runs after each turn. The threshold guard remains
+      // as a backstop for unusually large single turns or disabled rolling
+      // compaction.
+      const compactThresholdPct = options.compactThreshold ?? 85;
+      const autoCompactThreshold = Math.floor(contextSize * (compactThresholdPct / 100));
+      const postRollingEstimate = compacted
+        ? estimateCurrentContext(session, toolDescriptions, expanded)
+        : contextEstimate;
+      const postRollingPct = ((postRollingEstimate.totalTokens / contextSize) * 100).toFixed(1);
+      if (postRollingEstimate.totalTokens > autoCompactThreshold) {
+        console.log(kleur.dim(`Context estimate at ${postRollingPct}% — auto-compacting…`));
+        await runAutoCompact(session);
+      }
 
       await saveSession({
         id: session.id,
@@ -364,13 +546,6 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
         cumulativeInputTokens: session.cumulativeInputTokens,
         cumulativeOutputTokens: session.cumulativeOutputTokens,
       });
-
-      // Auto-compact when approaching 85% of the model's actual context window.
-      const autoCompactThreshold = Math.floor(contextSize * 0.85);
-      if (totalTokensUsed > autoCompactThreshold) {
-        console.log(kleur.dim(`Context at ${usagePct}% — auto-compacting…`));
-        await runAutoCompact(session);
-      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(kleur.red("✗ Error:"), message);
@@ -379,7 +554,7 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
   }
 
   await runHooks(session.hooks, "agentStop", { sessionId: session.id, cwd: process.cwd() });
-  await mcp.shutdown();
+  await shutdownMcp();
   cleanup();
 }
 
@@ -427,16 +602,66 @@ function printBanner(session: Session): void {
   console.log();
 }
 
+function applyModelRoute(session: Session, userInput: string): void {
+  const route = resolveRoutedModel(session.creds, userInput, session.mode);
+  if (route.modelName === session.modelName) return;
+
+  session.modelName = route.modelName;
+  session.languageModel = getModel(session.creds, route.modelName);
+  console.log(
+    kleur.dim(`Model route: ${route.taskClass} → ${route.modelName}`),
+  );
+}
+
 async function announceProjectMcp(): Promise<void> {
   const cfg = await loadProjectMcpConfig();
   if (cfg.servers.length === 0) return;
   const names = cfg.servers.map((s) => s.name).join(", ");
   console.log(
     kleur.dim(
-      `MCP project config: ${getProjectMcpConfigPath()} → ${names}`,
+      `MCP project config found: ${getProjectMcpConfigPath()} → ${names}`,
     ),
   );
   console.log();
+}
+
+function describeMcpServer(server: MCPServer): string {
+  if (server.transport === "stdio") {
+    return [server.command, ...(server.args ?? [])].filter(Boolean).join(" ");
+  }
+  return server.url ?? server.transport;
+}
+
+async function confirmProjectMcp(
+  cfg: MCPConfig,
+  prompt: (question: string) => Promise<string>,
+): Promise<boolean> {
+  const enabledServers = cfg.servers.filter((s) => s.enabled !== false);
+  if (enabledServers.length === 0) return false;
+
+  console.log(kleur.yellow("⚠"), kleur.bold("Project MCP servers are configured"));
+  console.log(
+    kleur.dim(
+      "Project .mcp.json can run local commands. Only trust it if you trust this repository.",
+    ),
+  );
+  for (const server of enabledServers) {
+    console.log(
+      kleur.dim(`  - ${server.name} (${server.transport}): ${describeMcpServer(server)}`),
+    );
+  }
+
+  const answer = (
+    await prompt(
+      kleur.cyan("Start project MCP servers? ") + kleur.dim("[y/N] ") + "› ",
+    )
+  ).trim().toLowerCase();
+
+  const trusted = answer === "y" || answer === "yes";
+  if (!trusted) {
+    console.log(kleur.dim("Skipped project MCP servers for this session."));
+  }
+  return trusted;
 }
 
 async function runShellPassthrough(command: string): Promise<void> {

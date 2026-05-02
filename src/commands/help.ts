@@ -19,6 +19,14 @@ Environment variables (override stored values):
   ${kleur.cyan("nlpilot version")}             Print version
   ${kleur.cyan("nlpilot help [TOPIC]")}        Show help (config | commands | environment | permissions)
 
+Useful cost controls:
+  ${kleur.cyan("--max-steps <n>")}             Cap model/tool loop steps per prompt
+  ${kleur.cyan("--max-output-tokens <n>")}     Cap assistant output tokens
+  ${kleur.cyan("--no-mcp")}                    Disable all MCP servers for this run
+  ${kleur.cyan("--no-model-routing")}          Use the configured model instead of auto-routing
+  ${kleur.cyan("--no-auto-compact")}           Disable rolling REPL compaction after each turn
+  ${kleur.cyan("--compact-threshold <pct>")}   REPL auto-compaction threshold
+
 In the REPL: ${kleur.cyan("/model")} lists models, ${kleur.cyan("/model <id>")} switches, ${kleur.cyan("/exit")} quits.`,
 
   environment: `${kleur.bold("Environment")}

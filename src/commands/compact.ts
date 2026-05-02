@@ -68,3 +68,57 @@ export async function runAutoCompact(session: Session): Promise<void> {
     );
   }
 }
+
+export async function runRollingCompact(
+  session: Session,
+  keepRecentAssistantTurns = 1,
+): Promise<boolean> {
+  const keepStart = recentTurnStart(session.messages, keepRecentAssistantTurns);
+  if (keepStart <= 0) return false;
+
+  const oldMessages = session.messages.slice(0, keepStart);
+  const recentMessages = session.messages.slice(keepStart);
+  if (oldMessages.length === 0 || recentMessages.length === 0) return false;
+
+  try {
+    const transcript = buildCompactTranscript(oldMessages);
+    const result = await generateText({
+      model: session.languageModel,
+      system:
+        "You are a conversation memory compressor. Produce a concise, information-dense working memory note. Preserve user goals, decisions, file paths touched, current plan, blockers, and open TODOs. Do not invent details.",
+      prompt: `Compact this older conversation history into working memory:\n\n${transcript}`,
+    });
+    const summary = result.text.trim();
+    session.messages = [
+      { role: "user", content: `Working memory from earlier conversation:\n${summary}` },
+      { role: "assistant", content: "Acknowledged. Continuing with this working memory." },
+      ...recentMessages,
+    ];
+    session.cumulativeInputTokens += result.usage.inputTokens ?? 0;
+    session.cumulativeOutputTokens += result.usage.outputTokens ?? 0;
+    console.log(kleur.green("✓"), "Compacted older context");
+    return true;
+  } catch (err) {
+    console.error(
+      kleur.red("✗"),
+      "Rolling compaction failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+    return false;
+  }
+}
+
+function recentTurnStart(messages: ModelMessage[], keepRecentAssistantTurns: number): number {
+  let assistantTurnsSeen = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== "assistant") continue;
+    assistantTurnsSeen++;
+    if (assistantTurnsSeen !== keepRecentAssistantTurns) continue;
+
+    for (let j = i - 1; j >= 0; j--) {
+      if (messages[j]?.role === "user") return j;
+    }
+    return i;
+  }
+  return 0;
+}

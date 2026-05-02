@@ -1,7 +1,9 @@
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import { spawn } from "node:child_process";
+import { lookup } from "node:dns/promises";
 import * as fs from "node:fs/promises";
+import { isIP } from "node:net";
 import * as path from "node:path";
 import kleur from "kleur";
 import { Glob } from "bun";
@@ -16,8 +18,11 @@ export interface FileChangeRecorder {
   record: (change: Omit<FileChange, "turn" | "timestamp">) => void;
 }
 
-const MAX_OUTPUT = 8_000;   // bash stdout/stderr cap per call
-const MAX_GREP_OUTPUT = 16_000; // total chars across all grep matches
+const MAX_OUTPUT = 4_000;   // bash stdout/stderr cap per call
+const MAX_GREP_OUTPUT = 8_000; // total chars across all grep matches
+const WEB_FETCH_MAX_BYTES = 100_000;
+const WEB_FETCH_TIMEOUT_MS = 15_000;
+const WEB_FETCH_MAX_REDIRECTS = 5;
 
 const REGEX_META = new RegExp(String.raw`[.*+?^${"$"}{}()|[\]\\]`, "g");
 
@@ -36,6 +41,191 @@ function resolveInsideCwd(p: string): string {
   return abs;
 }
 
+function ipv4ToInt(address: string): number | null {
+  const parts = address.split(".").map((part) => Number(part));
+  if (
+    parts.length !== 4 ||
+    parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+  ) {
+    return null;
+  }
+  return (
+    (((parts[0] ?? 0) << 24) >>> 0) +
+    ((parts[1] ?? 0) << 16) +
+    ((parts[2] ?? 0) << 8) +
+    (parts[3] ?? 0)
+  ) >>> 0;
+}
+
+function ipv4InCidr(address: string, base: string, bits: number): boolean {
+  const ip = ipv4ToInt(address);
+  const baseIp = ipv4ToInt(base);
+  if (ip == null || baseIp == null) return false;
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return (ip & mask) === (baseIp & mask);
+}
+
+function isPrivateOrReservedIp(address: string): boolean {
+  const family = isIP(address);
+  if (family === 4) {
+    return [
+      ["0.0.0.0", 8],
+      ["10.0.0.0", 8],
+      ["100.64.0.0", 10],
+      ["127.0.0.0", 8],
+      ["169.254.0.0", 16],
+      ["172.16.0.0", 12],
+      ["192.0.0.0", 24],
+      ["192.0.2.0", 24],
+      ["192.168.0.0", 16],
+      ["198.18.0.0", 15],
+      ["198.51.100.0", 24],
+      ["203.0.113.0", 24],
+      ["224.0.0.0", 4],
+      ["240.0.0.0", 4],
+    ].some(([base, bits]) => ipv4InCidr(address, String(base), Number(bits)));
+  }
+
+  if (family !== 6) return true;
+
+  const normalized = address.toLowerCase();
+  if (normalized.startsWith("::ffff:")) {
+    const mapped = normalized.slice("::ffff:".length);
+    return isPrivateOrReservedIp(mapped);
+  }
+  if (
+    normalized === "::" ||
+    normalized === "::1" ||
+    normalized.startsWith("0:0:0:0:0:0:0:") ||
+    normalized.startsWith("2001:db8:")
+  ) {
+    return true;
+  }
+
+  const first = Number.parseInt(normalized.split(":")[0] ?? "", 16);
+  if (!Number.isFinite(first)) return true;
+  return (
+    (first & 0xfe00) === 0xfc00 || // fc00::/7 unique local
+    (first & 0xffc0) === 0xfe80 || // fe80::/10 link local
+    (first & 0xff00) === 0xff00 // ff00::/8 multicast
+  );
+}
+
+function hostnameForChecks(hostname: string): string {
+  if (hostname.startsWith("[") && hostname.endsWith("]")) {
+    return hostname.slice(1, -1);
+  }
+  return hostname;
+}
+
+function assertHttpUrlShape(url: URL): void {
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("Only http:// and https:// URLs are allowed");
+  }
+  if (!url.hostname) {
+    throw new Error("URL must include a hostname");
+  }
+  const hostname = hostnameForChecks(url.hostname);
+  if (isIP(hostname) && isPrivateOrReservedIp(hostname)) {
+    throw new Error("Requests to private, loopback, or reserved IP addresses are not allowed");
+  }
+}
+
+async function assertPublicHttpUrl(url: URL): Promise<void> {
+  assertHttpUrlShape(url);
+  const hostname = hostnameForChecks(url.hostname);
+
+  if (isIP(hostname)) {
+    return;
+  }
+
+  const results = await lookup(hostname, { all: true, verbatim: true });
+  if (results.length === 0) {
+    throw new Error(`Could not resolve hostname: ${hostname}`);
+  }
+  const blocked = results.find((result) => isPrivateOrReservedIp(result.address));
+  if (blocked) {
+    throw new Error(
+      `Hostname resolves to a private, loopback, or reserved IP address: ${blocked.address}`,
+    );
+  }
+}
+
+async function readResponseBody(res: Response, maxBytes: number): Promise<{
+  body: string;
+  truncated: boolean;
+}> {
+  if (!res.body) return { body: "", truncated: false };
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+
+  while (total < maxBytes) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+
+    const remaining = maxBytes - total;
+    if (value.byteLength > remaining) {
+      chunks.push(value.slice(0, remaining));
+      total += remaining;
+      truncated = true;
+      break;
+    }
+
+    chunks.push(value);
+    total += value.byteLength;
+  }
+
+  if (!truncated) {
+    const next = await reader.read();
+    truncated = !next.done;
+  }
+  if (truncated) {
+    await reader.cancel().catch(() => undefined);
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return {
+    body: new TextDecoder().decode(merged),
+    truncated,
+  };
+}
+
+async function fetchPublicUrl(
+  initialUrl: URL,
+  method: "GET" | "POST",
+): Promise<{ url: string; response: Response }> {
+  let current = initialUrl;
+  for (let redirects = 0; redirects <= WEB_FETCH_MAX_REDIRECTS; redirects++) {
+    await assertPublicHttpUrl(current);
+    const response = await fetch(current, {
+      method,
+      redirect: "manual",
+      signal: AbortSignal.timeout(WEB_FETCH_TIMEOUT_MS),
+    });
+
+    if (![301, 302, 303, 307, 308].includes(response.status)) {
+      return { url: current.toString(), response };
+    }
+
+    const location = response.headers.get("location");
+    if (!location) return { url: current.toString(), response };
+    current = new URL(location, current);
+    method = "GET";
+  }
+
+  throw new Error(`Too many redirects (>${WEB_FETCH_MAX_REDIRECTS})`);
+}
+
 interface ToolDeps {
   approvals: ApprovalState;
   prompt: PromptFn;
@@ -50,27 +240,24 @@ function logToolCall(name: string, summary: string): void {
   console.log(kleur.dim(`  ⚙ ${name}: ${summary}`));
 }
 
-const MAX_VIEW_LINES = 200; // max lines returned by the view tool per call
+const MAX_VIEW_LINES = 160; // max lines returned by the view tool per call
 
 /**
  * Build the complete set of built-in tools available to the agent.
  *
  * @param deps - Shared dependencies including approval state, prompt function, and file change recorder.
- * @returns A Vercel AI SDK `ToolSet` containing view, bash, edit, create, list_dir, glob, and grep.
+ * @returns A Vercel AI SDK `ToolSet` containing view, bash, edit, create, grep, and web_fetch.
  */
 export function buildTools(deps: ToolDeps): ToolSet {
   const { approvals, prompt, recorder, viewedFiles, editedFiles } = deps;
 
   return {
     view: tool({
-      description:
-        "Read lines from a file. Returns at most 200 lines. " +
-        "Choose a wide range that covers everything you need — do NOT call view multiple times on the same file. " +
-        "Omit startLine/endLine to read the first 200 lines.",
+      description: "Read file lines. Max 160 lines; avoid repeated reads.",
       inputSchema: z.object({
         path: z.string(),
-        startLine: z.number().int().min(1).optional().describe("1-based inclusive start line"),
-        endLine: z.number().int().min(1).optional().describe("1-based inclusive end line"),
+        startLine: z.number().int().min(1).optional().describe("1-based start"),
+        endLine: z.number().int().min(1).optional().describe("1-based end"),
       }),
       execute: async ({ path: p, startLine, endLine }) => {
         let abs: string;
@@ -104,7 +291,7 @@ export function buildTools(deps: ToolDeps): ToolSet {
         const s = Math.max(1, startLine ?? 1);
         // Enforce a minimum read of MIN_VIEW_LINES lines so the model can't
         // request tiny slices and then loop with follow-up calls.
-        const MIN_VIEW_LINES = 150;
+        const MIN_VIEW_LINES = 80;
         const requestedEnd = endLine != null ? Math.min(total, endLine) : total;
         const enforcedEnd = Math.max(requestedEnd, Math.min(total, s + MIN_VIEW_LINES - 1));
         const capped = Math.min(enforcedEnd, s + MAX_VIEW_LINES - 1);
@@ -128,9 +315,7 @@ export function buildTools(deps: ToolDeps): ToolSet {
     }),
 
     bash: tool({
-      description:
-        "Run a shell command. Use ONLY for computation, compilation, running tests, or operations that have no dedicated tool. " +
-        "Do NOT use for: file discovery (use grep filenamesOnly:true), reading files (use view), searching text (use grep).",
+      description: "Run shell commands for tests/builds/computation; do not use for file reads or search.",
       inputSchema: z.object({
         command: z.string(),
         cwd: z.string().optional(),
@@ -192,7 +377,7 @@ export function buildTools(deps: ToolDeps): ToolSet {
       description: "Replace unique oldString with newString in a file.",
       inputSchema: z.object({
         path: z.string(),
-        oldString: z.string().describe("Must appear exactly once in the file"),
+        oldString: z.string().describe("Must match once"),
         newString: z.string(),
       }),
       execute: async ({ path: p, oldString, newString }) => {
@@ -262,9 +447,9 @@ export function buildTools(deps: ToolDeps): ToolSet {
     }),
 
     grep: tool({
-      description: "Search file content by pattern. Set filenamesOnly:true to list files matching a name glob instead (replaces glob tool).",
+      description: "Search file content, or list files with filenamesOnly:true.",
       inputSchema: z.object({
-        pattern: z.string().describe("Content pattern, or filename glob when filenamesOnly:true"),
+        pattern: z.string().describe("Search pattern or filename glob"),
         glob: z.string().optional(),
         regex: z.boolean().optional(),
         ignoreCase: z.boolean().optional(),
@@ -350,23 +535,18 @@ export function buildTools(deps: ToolDeps): ToolSet {
     }),
 
     web_fetch: tool({
-      description: "Fetch a URL and return its text (HTML stripped to plain text). Only public URLs are allowed.",
+      description: "Fetch public HTTP/HTTPS URL text.",
       inputSchema: z.object({
         url: z.url(),
         method: z.enum(["GET", "POST"]).optional(),
       }),
       execute: async ({ url, method }) => {
-        // SSRF guard: block requests to private/loopback networks
         let parsedUrl: URL;
         try {
           parsedUrl = new URL(url);
-        } catch {
-          return { error: "Invalid URL" };
-        }
-        const hostname = parsedUrl.hostname.toLowerCase();
-        const PRIVATE = /^(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|::1|fc00:|fe80:|0\.0\.0\.0|169\.254\.)/;
-        if (PRIVATE.test(hostname)) {
-          return { error: "Requests to private/loopback addresses are not allowed" };
+          assertHttpUrlShape(parsedUrl);
+        } catch (err) {
+          return { error: err instanceof Error ? err.message : String(err) };
         }
         const decision = await requestApproval(approvals, prompt, {
           toolName: "web_fetch",
@@ -375,10 +555,14 @@ export function buildTools(deps: ToolDeps): ToolSet {
         if (decision === "deny")
           return { denied: true, message: "User denied fetch" };
         try {
-          const res = await fetch(url, { method: method ?? "GET" });
+          const { url: finalUrl, response: res } = await fetchPublicUrl(
+            parsedUrl,
+            method ?? "GET",
+          );
           const contentType = res.headers.get("content-type") ?? "";
-          let body = await res.text();
-          if (contentType.includes("html")) {
+          const read = await readResponseBody(res, WEB_FETCH_MAX_BYTES);
+          let body = read.body;
+          if (contentType.toLowerCase().includes("html")) {
             body = body
               .replaceAll(/<script[\s\S]*?<\/script>/gi, "")
               .replaceAll(/<style[\s\S]*?<\/style>/gi, "")
@@ -386,7 +570,15 @@ export function buildTools(deps: ToolDeps): ToolSet {
               .replaceAll(/\s+/g, " ")
               .trim();
           }
-          return { url, status: res.status, contentType, body: truncate(body) };
+          return {
+            url: finalUrl,
+            status: res.status,
+            contentType,
+            body: truncate(body),
+            ...(read.truncated
+              ? { note: `Response body truncated at ${WEB_FETCH_MAX_BYTES.toLocaleString()} bytes` }
+              : undefined),
+          };
         } catch (err) {
           return { error: err instanceof Error ? err.message : String(err) };
         }

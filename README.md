@@ -100,6 +100,12 @@ nlpilot --prompt "Write unit tests for src/utils.ts" --output-format json
 | `--allow-tool <name>` | | Always allow a specific tool (repeatable, comma-separated) |
 | `--deny-tool <name>` | | Always deny a specific tool (repeatable, comma-separated) |
 | `--additional-mcp-config <path>` | | Load extra MCP servers from a config file |
+| `--max-steps <n>` | | Maximum model/tool loop steps per prompt |
+| `--max-output-tokens <n>` | | Maximum assistant output tokens |
+| `--no-mcp` | | Disable all MCP servers for this run |
+| `--no-model-routing` | | Disable automatic cheap/balanced/reasoning model routing |
+| `--no-auto-compact` | | Disable rolling REPL compaction after each turn |
+| `--compact-threshold <pct>` | | Auto-compact REPL context when estimated usage exceeds this percent |
 | `--continue` | | Resume the most recent session in the current directory |
 | `--version` | `-v` | Print version |
 
@@ -136,12 +142,11 @@ The agent has access to these built-in tools. Each tool that modifies the filesy
 | Tool | Description |
 |---|---|
 | `bash` | Execute shell commands via `/bin/sh -c` |
-| `read_file` | Read a file (up to 16 KB, or the first N lines) |
-| `write_file` | Write or overwrite a file (tracks changes for `/undo`) |
-| `edit_file` | Apply a targeted string-replace patch to an existing file |
-| `list_dir` | List directory contents with optional glob pattern |
-| `glob` | Glob search across the workspace |
-| `grep` | Search file contents with a regex pattern |
+| `view` | Read line ranges from a file |
+| `edit` | Apply a targeted string replacement to an existing file |
+| `create` | Create a new file (tracks changes for `/undo`) |
+| `grep` | Search file contents, or list files with `filenamesOnly:true` |
+| `web_fetch` | Fetch public HTTP/HTTPS URLs with approval and SSRF protections |
 
 ---
 
@@ -223,21 +228,35 @@ nlpilot automatically manages context window usage through several techniques:
 
 #### Message Trimming
 Large tool outputs (like verbose file reads or bash results) are automatically compressed in the conversation history:
-- Kept in full: Last 3 assistant turns (to preserve recent context)
-- Trimmed: Older outputs larger than 800 characters are replaced with `[output trimmed — X chars]`
-- Benefit: Preserves context window space while retaining relevant recent interactions
+- Kept in full: Last assistant turn (to preserve recent context)
+- Tool results: Older outputs are replaced with structured summaries such as `view(src/session.ts:1-160) -> read 160 lines`
+- Duplicate tool results: Repeated large outputs are replaced with reference stubs
+- Older text turns: Long user/assistant messages are compacted and repeated attachment/project-context blocks are removed
+- Benefit: Preserves context window space while retaining paths, counts, statuses, and errors
 
 #### Output Limits
 To prevent single tool calls from consuming too much context:
-- **Bash output** limited to 8,000 characters
-- **File viewing** limited to 80 default lines or 6,000 bytes
+- **Bash output** limited to 4,000 characters
+- **Grep output** limited to 8,000 characters
+- **File viewing** limited to 160 lines per call, with an 80-line minimum window
+- **Web fetch body reads** limited to 100,000 bytes before final text truncation
 - **Automatic abbreviation**: Tool outputs exceeding limits are truncated with a note
 
+#### Prompt Context Selection
+Repeated system prompt context is kept small by default:
+- Project instructions and file snapshots are included only for project/code-related prompts
+- Skills and agents are listed only when the prompt asks about them
+- Source files are injected as a directory summary plus key files, not a full tree
+- File snapshots appear on the first project-related turn or when the user asks about repo structure/files
+
 #### Auto-Compaction
-When the conversation history grows very large, use `/compact` to summarize the entire conversation:
-- Creates a compressed summary of the discussion (counted toward cumulative tokens)
-- Resets cumulative token tracking to reflect the new baseline
-- Useful for long-running sessions to free up context window
+The REPL now performs rolling compaction after each turn:
+- Older history is summarized into a compact working-memory note
+- The latest exchange stays intact for immediate continuity
+- The `--compact-threshold <pct>` guard remains as a backstop for unusually large turns
+- Use `--no-auto-compact` to keep full persisted history until `/compact` or the threshold guard runs
+
+Manual `/compact` still summarizes the full conversation and resets cumulative token tracking to the compacted baseline.
 
 #### Cumulative Token Tracking
 Sessions track cumulative input and output tokens across all turns:
@@ -275,7 +294,7 @@ Place `.md` files in `.nlpilot/agents/`. Each file defines a specialized agent p
 name: Code Reviewer
 description: Strict code review with security focus
 model: claude-opus-4-6
-tools: read_file,grep,list_dir
+tools: view,grep
 ---
 
 You are a strict code reviewer. Focus on security, performance, and maintainability...
@@ -369,6 +388,18 @@ nlpilot login          # Re-run the wizard to select a different model
 nlpilot --model <id>   # Override for a single run
 ```
 
+### Cost-Aware Model Routing
+
+When no explicit model is provided, nlpilot classifies each prompt and routes to a cheaper capable model where possible:
+
+| Task class | Typical prompts | Routing behavior |
+|---|---|---|
+| `cheap` | help-like questions, listings, repo structure, simple search/explain prompts | cheapest catalog model for the provider |
+| `balanced` | normal coding edits and implementation work | balanced coding/general model |
+| `reasoning` | debugging, security, architecture, complex analysis, plan mode | configured default model |
+
+`--model <id>`, `NLPILOT_MODEL`, `/model <id>`, and agent model overrides pin the chosen model and bypass automatic routing. Custom `baseUrl` credentials also bypass routing because those endpoints may not support the built-in catalog names. Use `--no-model-routing` to disable this behavior for a run.
+
 ---
 
 ## Supported Models
@@ -410,6 +441,7 @@ src/
 ├── index.ts              # CLI entry point, command definitions
 ├── config.ts             # Credentials load/save, env overrides
 ├── models.ts             # Model catalog per provider
+├── model-router.ts       # Cheap/balanced/reasoning model selection
 ├── providers.ts          # AI SDK provider factory (gateway + custom endpoint)
 ├── session.ts            # Session interface, system prompt builder
 ├── persistence.ts        # Session file I/O (~/.nlpilot/sessions/)
@@ -442,8 +474,10 @@ src/
 #### Context Management & Optimization
 - **Automatic message trimming**: Large tool outputs in conversation history are now automatically compressed to preserve context window. Recent assistant turns retain full context, while older verbose outputs are replaced with `[output trimmed — X chars]` notation.
 - **Output limits**: Reduced default output sizes to optimize context usage:
-  - Bash command output capped at 8,000 characters
-  - File viewing limited to 80 lines or 6,000 bytes (configurable via `VIEW_DEFAULT_LINES` and `VIEW_MAX_BYTES`)
+  - Bash command output capped at 4,000 characters
+  - Grep output capped at 8,000 characters
+  - File viewing limited to 160 lines per call
+  - Web fetch body reads capped at 100,000 bytes before final text truncation
 - **Cumulative token tracking**: Sessions now track total input/output tokens across all turns and resumptions
 - **Auto-compaction token reset**: When `/compact` summarizes a conversation, cumulative token counts reset to reflect the new baseline
 

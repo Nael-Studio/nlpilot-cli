@@ -138,16 +138,21 @@ export async function loadProjectMcpConfig(cwd: string = process.cwd()): Promise
 }
 
 /**
- * Merged view of global + project servers. Project entries override global entries with the same name.
- */
-/**
  * Merge global and project MCP configs. Project entries override global entries with the same name.
  *
  * @param cwd - Project directory. Defaults to `process.cwd()`.
+ * @param options.includeProject - Whether to include project `.mcp.json` servers.
  * @returns A merged MCP config containing both global and project servers.
  */
-export async function loadEffectiveMcpConfig(cwd: string = process.cwd()): Promise<MCPConfig> {
-  const [global, project] = await Promise.all([loadMcpConfig(), loadProjectMcpConfig(cwd)]);
+export async function loadEffectiveMcpConfig(
+  cwd: string = process.cwd(),
+  options: { includeProject?: boolean } = {},
+): Promise<MCPConfig> {
+  const includeProject = options.includeProject ?? true;
+  const [global, project] = await Promise.all([
+    loadMcpConfig(),
+    includeProject ? loadProjectMcpConfig(cwd) : Promise.resolve({ servers: [] }),
+  ]);
   const byName = new Map<string, MCPServer>();
   for (const s of global.servers) byName.set(s.name, s);
   for (const s of project.servers) byName.set(s.name, s); // project wins

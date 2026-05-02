@@ -34,6 +34,8 @@ export interface SlashContext {
   printHelp: () => void;
   /** Request app exit (returns true to break the REPL loop). */
   setShouldExit: () => void;
+  /** Disable automatic per-turn model routing after an explicit model change. */
+  setModelPinned?: () => void;
   /**
    * Flat list of every registered tool description string.
    * Used by /stats to estimate tool-schema token overhead that is sent to
@@ -89,7 +91,7 @@ const COMMANDS: SlashSpec[] = [
   {
     names: ["model", "models"],
     description: "List available models, or switch with /model <id>",
-    handler: ({ session }, args) => {
+    handler: ({ session, setModelPinned }, args) => {
       if (!args) {
         printAvailableModels(session);
         return;
@@ -97,6 +99,7 @@ const COMMANDS: SlashSpec[] = [
       try {
         session.languageModel = getModel(session.creds, args);
         session.modelName = args;
+        setModelPinned?.();
         console.log(kleur.green("✓"), `Switched model to ${kleur.bold(args)}`);
       } catch (err) {
         console.error(kleur.red("✗"), err instanceof Error ? err.message : String(err));
@@ -168,7 +171,10 @@ const COMMANDS: SlashSpec[] = [
       const contextSize = getModelContextSize(provider, modelId);
 
       // Estimate system prompt tokens.
-      const sysPrompt = buildSystemPrompt(session);
+      const lastUser = [...session.messages].reverse().find((m) => m.role === "user");
+      const latestUserMessage =
+        lastUser && typeof lastUser.content === "string" ? lastUser.content : undefined;
+      const sysPrompt = buildSystemPrompt(session, { latestUserMessage });
       const sysTokens = Math.ceil(sysPrompt.length / 4);
 
       // Estimate messages tokens.
@@ -425,7 +431,7 @@ const COMMANDS: SlashSpec[] = [
   {
     names: ["agent", "agents"],
     description: "List custom agents (or activate one with /agent <name>)",
-    handler: async ({ session }, args) => {
+    handler: async ({ session, setModelPinned }, args) => {
       if (!args) {
         if (session.agents.length === 0) {
           console.log(kleur.dim("No custom agents in .nlpilot/agents/"));
@@ -449,6 +455,7 @@ const COMMANDS: SlashSpec[] = [
         try {
           session.languageModel = getModel(session.creds, target.model);
           session.modelName = target.model;
+          setModelPinned?.();
         } catch {
           /* ignore */
         }

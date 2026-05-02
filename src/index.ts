@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { Command, Option } from "commander";
+import { Command, InvalidArgumentError, Option } from "commander";
 import kleur from "kleur";
 import pkg from "../package.json" with { type: "json" };
 import { loginCommand } from "./commands/login.ts";
@@ -25,10 +25,32 @@ interface RootOptions {
   allowTool?: string[];
   denyTool?: string[];
   continue?: boolean;
+  maxSteps?: number;
+  maxOutputTokens?: number;
+  mcp?: boolean;
+  compactThreshold?: number;
+  modelRouting?: boolean;
+  autoCompact?: boolean;
 }
 
 function collect(value: string, prev: string[] = []): string[] {
   return prev.concat(value.split(",").map((v) => v.trim()).filter(Boolean));
+}
+
+function parsePositiveInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new InvalidArgumentError("Must be a positive integer");
+  }
+  return parsed;
+}
+
+function parsePercentage(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
+    throw new InvalidArgumentError("Must be a number from 1 to 100");
+  }
+  return parsed;
 }
 
 const program = new Command();
@@ -53,6 +75,16 @@ program
   .option("--no-ask-user", "Do not ask for user confirmation (autopilot mode)")
   .option("--enable-reasoning-summaries", "Show reasoning/thinking summaries from the model")
   .option("--additional-mcp-config <path>", "Load additional MCP servers from a file")
+  .option("--max-steps <n>", "Maximum model/tool loop steps per prompt", parsePositiveInteger)
+  .option("--max-output-tokens <n>", "Maximum assistant output tokens", parsePositiveInteger)
+  .option("--no-mcp", "Disable all MCP servers for this run")
+  .option("--no-model-routing", "Disable automatic cheap/balanced/reasoning model routing")
+  .option("--no-auto-compact", "Disable rolling REPL compaction after each turn")
+  .option(
+    "--compact-threshold <pct>",
+    "Auto-compact REPL context when estimated usage exceeds this percent",
+    parsePercentage,
+  )
   .option(
     "--allow-tool <tool>",
     "Always allow the named tool (repeatable, comma-separated)",
@@ -83,6 +115,10 @@ program
         continueSession: opts.continue,
         enableReasoningSummaries: opts.enableReasoningSummaries,
         additionalMcpConfig: opts.additionalMcpConfig,
+        maxSteps: opts.maxSteps,
+        maxOutputTokens: opts.maxOutputTokens,
+        mcp: opts.mcp !== false,
+        modelRouting: opts.modelRouting !== false,
       });
       process.exit(code);
     }
@@ -93,6 +129,12 @@ program
       allowAll,
       allow,
       deny,
+      maxSteps: opts.maxSteps,
+      maxOutputTokens: opts.maxOutputTokens,
+      mcp: opts.mcp !== false,
+      compactThreshold: opts.compactThreshold,
+      modelRouting: opts.modelRouting !== false,
+      autoCompact: opts.autoCompact !== false,
     });
   });
 

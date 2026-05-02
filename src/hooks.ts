@@ -61,6 +61,17 @@ export interface HookContext {
   cwd?: string;
 }
 
+function hookMatches(hook: HookSpec, event: HookEvent, ctx: HookContext): boolean {
+  if (hook.event !== event) return false;
+  if (!hook.match || !ctx.toolName) return true;
+
+  try {
+    return new RegExp(hook.match).test(ctx.toolName);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Execute all hooks matching the given event and optional tool-name filter.
  *
@@ -75,13 +86,7 @@ export async function runHooks(
   event: HookEvent,
   ctx: HookContext,
 ): Promise<void> {
-  const matching = cfg.hooks.filter((h) => {
-    if (h.event !== event) return false;
-    if (h.match && ctx.toolName && !new RegExp(h.match).test(ctx.toolName)) {
-      return false;
-    }
-    return true;
-  });
+  const matching = cfg.hooks.filter((h) => hookMatches(h, event, ctx));
   for (const hook of matching) {
     try {
       if (hook.type === "command" && hook.command) {

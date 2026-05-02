@@ -66,21 +66,43 @@ A `Session` is the central state object that lives for the duration of a REPL ru
 **Message Trimming (`trimMessagesForSending`)**
 - Before each API call, old tool-result messages are compressed to prevent context-window bloat.
 - Keeps the most recent assistant turn fully intact.
-- Large outputs (>800 chars) are truncated with a stub message. Error outputs get a higher cap (1,500 chars).
+- Older tool results become structured summaries, repeated large outputs become reference stubs, and older text turns are compacted.
 
 ---
 
 ## Provider Abstraction (`src/providers.ts`)
 
 - **`getModel(creds, override?)`** returns a Vercel AI SDK `LanguageModel`.
-- If `creds.baseUrl` is set (e.g., Azure Foundry), it instantiates a provider directly (`createAnthropic` or `createOpenAI`) with the custom base URL.
+- If `creds.baseUrl` is set (e.g., Azure Foundry), it instantiates a provider client directly (`createAnthropic` or `createOpenAI`) with the custom base URL.
 - Otherwise, it uses `@ai-sdk/gateway` and qualifies the model name as `<provider>/<model-id>`.
-- Provider inference from model prefixes (e.g., `gpt-*` → OpenAI, `claude-*` → Anthropic) ensures correct routing even when the stored credential provider differs.
+- Provider inference from model-name prefixes (e.g., `gpt-*` / `o1*` / `o3*` → OpenAI, `claude-*` → Anthropic, `gemini-*` → Google, `deepseek-*` → DeepSeek, `kimi-*` / `moonshotai/*` → Moonshot AI) ensures correct routing even when the stored credential provider differs.
+
+**Human-readable provider labels (`PROVIDER_LABELS`)**
+
+- `PROVIDER_LABELS` provides display names like `OpenAI`, `Anthropic`, etc., and is used by user-facing commands and REPL banners.
 
 **Catalog (`src/models.ts`)**
 - `models.json` in `~/.nlpilot` stores the curated model list.
 - A fallback embedded catalog exists for first-run initialization.
 - `getModelContextSize()` lets the UI warn when a conversation nears the context limit.
+
+---
+
+## Model Routing (`src/model-router.ts`)
+
+nlpilot can dynamically pick a model per prompt.
+
+- **`classifyTask(prompt, mode)` → `TaskClass`**
+  - `cheap` / `balanced` / `reasoning`
+  - classification is driven by prompt keywords/length and by `mode` (in `plan`, it favors `reasoning`).
+- **`resolveRoutedModel(creds, prompt, mode)` → `{ taskClass, modelName, reason }`**
+  - uses `creds.model` (or `DEFAULT_MODELS[creds.provider]`) as a fallback
+  - selects a preferred model ID from a per-provider candidate list for the chosen `taskClass`
+  - only returns a routed candidate if it exists in the provider’s model catalog; otherwise it keeps the configured fallback.
+
+**Where it’s applied**
+- REPL: before each turn, `applyModelRoute()` updates `session.modelName` and recreates the AI SDK client.
+- One-shot: when model routing isn’t disabled, it resolves a routed model name from the prompt/mode.
 
 ---
 
@@ -116,13 +138,15 @@ Built-in tools are plain Vercel AI SDK `tool()` definitions:
 1. **Resolve credentials** — exit early if none.
 2. **Restore session** — if `--continue`, load the most recent persisted messages.
 3. **Load customization** — instructions, agents, skills, hooks.
-4. **Pre-scan source files** — glob `**/*.{ts,tsx,js,jsx,json,md}` (max 300) and inject into the session so the model never needs discovery tool calls.
+4. **Pre-scan source files** — glob source-like files, keep a compact key-file snapshot, and summarize larger directory structures.
 5. **Start MCP runtime** — merge external tools.
 6. **Readline loop** — for each user input:
    - Detect slash commands (`/help`, `/model`, `/compact`, etc.) and handle via `runSlashCommand()`.
    - Otherwise stream the model response with `streamText()`.
    - As the model emits tool calls, execute them immediately (with approval checks) and stream the results back.
-   - Record file changes, update token counters, and auto-compact if the context window is nearly full.
+   - Record file changes and update token counters.
+   - Run rolling compaction after the turn so older history becomes working memory while the latest exchange remains intact.
+   - Run threshold-based full auto-compaction only as a backstop for unusually large contexts.
 7. **Persist** — save the session to disk after each turn.
 
 ---
@@ -176,7 +200,8 @@ Hooks are fire-and-forget: failures are silently swallowed so they can never cra
 
 - Tracks cumulative input/output tokens across the session.
 - Provides `estimateTokens()` for local context-window heuristics.
-- `/compact` summarizes old conversation history to free up context tokens.
+- Rolling auto-compaction summarizes older history after each REPL turn.
+- `/compact` summarizes the full conversation history to free up context tokens.
 
 ---
 

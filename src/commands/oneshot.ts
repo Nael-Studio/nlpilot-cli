@@ -2,6 +2,7 @@ import { stdout } from "node:process";
 import { streamText, stepCountIs } from "ai";
 import { resolveCredentials, DEFAULT_MODELS } from "../config.ts";
 import { getModel } from "../providers.ts";
+import { resolveRoutedModel } from "../model-router.ts";
 import { buildTools } from "../tools/index.ts";
 import {
   createApprovalState,
@@ -35,6 +36,10 @@ export interface OneShotOptions {
   continueSession?: boolean;
   enableReasoningSummaries?: boolean;
   additionalMcpConfig?: string;
+  maxSteps?: number;
+  maxOutputTokens?: number;
+  mcp?: boolean;
+  modelRouting?: boolean;
 }
 
 interface JsonEvent {
@@ -63,7 +68,11 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     return 1;
   }
 
-  const modelName = opts.model ?? creds.model ?? DEFAULT_MODELS[creds.provider];
+  const explicitModel = Boolean(opts.model || process.env.NLPILOT_MODEL);
+  const shouldRouteModel = opts.modelRouting !== false && !explicitModel && !creds.baseUrl;
+  const modelName = shouldRouteModel
+    ? resolveRoutedModel(creds, opts.prompt, opts.allowAll ? "autopilot" : "ask").modelName
+    : opts.model ?? creds.model ?? DEFAULT_MODELS[creds.provider];
 
   // Restore prior conversation if --continue
   let priorMessages: Session["messages"] = [];
@@ -127,11 +136,18 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     },
   });
 
-  // Bring up MCP runtime (global + project .mcp.json + additional) and merge its tools.
-  let mcpConfig = await loadEffectiveMcpConfig();
-  mcpConfig = await mergeAdditionalMcpConfig(mcpConfig, opts.additionalMcpConfig);
-  const mcp = await startMcpRuntime(mcpConfig.servers);
-  Object.assign(tools, mcp.tools);
+  let shutdownMcp = async (): Promise<void> => undefined;
+  if (opts.mcp !== false) {
+    // Bring up MCP runtime (global + project .mcp.json + additional) and merge its tools.
+    let mcpConfig = await loadEffectiveMcpConfig();
+    mcpConfig = await mergeAdditionalMcpConfig(mcpConfig, opts.additionalMcpConfig);
+    const mcp = await startMcpRuntime(mcpConfig.servers, {
+      approvals,
+      prompt: promptFn,
+    });
+    Object.assign(tools, mcp.tools);
+    shutdownMcp = mcp.shutdown;
+  }
 
   session.turn += 1;
   session.messages.push({ role: "user", content: opts.prompt });
@@ -145,10 +161,11 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     }
     const result = streamText({
       model: session.languageModel,
-      system: buildSystemPrompt(session),
+      system: buildSystemPrompt(session, { latestUserMessage: opts.prompt }),
       messages: trimMessagesForSending(session.messages),
       tools,
-      stopWhen: stepCountIs(20),
+      stopWhen: stepCountIs(opts.maxSteps ?? 100),
+      maxOutputTokens: opts.maxOutputTokens,
     });
 
     let assistantText = "";
@@ -208,13 +225,13 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     });
 
     if (isJson) emitJson({ type: "done" });
-    await mcp.shutdown();
+    await shutdownMcp();
     return 0;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (isJson) emitJson({ type: "error", data: { message } });
     else console.error("✗ Error:", message);
-    await mcp.shutdown();
+    await shutdownMcp();
     return 1;
   }
 }

@@ -31,6 +31,8 @@ interface RootOptions {
   compactThreshold?: number;
   modelRouting?: boolean;
   autoCompact?: boolean;
+  compact?: boolean;
+  interactiveApprovals?: boolean;
 }
 
 function collect(value: string, prev: string[] = []): string[] {
@@ -98,10 +100,29 @@ program
     [] as string[],
   )
   .option("--continue", "Resume the most recent session in this cwd")
+  .option("--compact", "Summarize and compact the most recent session, then exit")
+  .option("--interactive-approvals", "Read tool approval decisions from stdin in JSON one-shot mode")
   .action(async (opts: RootOptions) => {
     const allowAll = Boolean(opts.allowAllTools ?? opts.allowAll ?? opts.noAskUser);
     const allow = opts.allowTool ?? [];
     const deny = opts.denyTool ?? [];
+
+    if (opts.compact) {
+      const code = await runOneShot({
+        prompt: "",
+        model: opts.model,
+        silent: opts.silent,
+        outputFormat: opts.outputFormat ?? "text",
+        allowAll,
+        allow,
+        deny,
+        compact: true,
+        mcp: false,
+        modelRouting: opts.modelRouting !== false,
+        interactiveApprovals: opts.interactiveApprovals,
+      });
+      process.exit(code);
+    }
 
     if (opts.prompt) {
       const code = await runOneShot({
@@ -119,6 +140,7 @@ program
         maxOutputTokens: opts.maxOutputTokens,
         mcp: opts.mcp !== false,
         modelRouting: opts.modelRouting !== false,
+        interactiveApprovals: opts.interactiveApprovals,
       });
       process.exit(code);
     }

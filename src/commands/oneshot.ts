@@ -1,8 +1,10 @@
 import { stdout } from "node:process";
-import { streamText, stepCountIs } from "ai";
+import * as readline from "node:readline/promises";
+import { streamText, generateText, stepCountIs } from "ai";
 import { resolveCredentials, DEFAULT_MODELS } from "../config.ts";
 import { getModel } from "../providers.ts";
 import { resolveRoutedModel } from "../model-router.ts";
+import { getModelContextSize } from "../models.ts";
 import { buildTools } from "../tools/index.ts";
 import {
   createApprovalState,
@@ -22,11 +24,13 @@ import {
 import { loadEffectiveMcpConfig, mergeAdditionalMcpConfig } from "../mcp.ts";
 import { startMcpRuntime } from "../tools/mcp.ts";
 import { startLoader, stopLoader, stopLoaderWithMessage } from "../ui/loader.ts";
+import { buildCompactTranscript } from "./compact.ts";
 
 export type OutputFormat = "text" | "json";
 
 export interface OneShotOptions {
   prompt: string;
+  compact?: boolean;
   model?: string;
   silent?: boolean;
   outputFormat?: OutputFormat;
@@ -40,6 +44,7 @@ export interface OneShotOptions {
   maxOutputTokens?: number;
   mcp?: boolean;
   modelRouting?: boolean;
+  interactiveApprovals?: boolean;
 }
 
 interface JsonEvent {
@@ -47,7 +52,9 @@ interface JsonEvent {
     | "message"
     | "tool-call"
     | "tool-result"
+    | "approval-request"
     | "text"
+    | "usage"
     | "error"
     | "done";
   data?: unknown;
@@ -68,6 +75,71 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     return 1;
   }
 
+  // ── Compact mode ─────────────────────────────────────────────────────────────
+  // Load the most recent session, stream a summarization, then rewrite the
+  // session messages on disk so the next --continue uses the compact context.
+  if (opts.compact) {
+    const prior = await loadMostRecentSession();
+    if (!prior || prior.messages.length === 0) {
+      if (opts.outputFormat === "json") {
+        emitJson({ type: "text", data: "Nothing to compact." });
+        emitJson({ type: "done" });
+      } else {
+        console.log("Nothing to compact.");
+      }
+      return 0;
+    }
+
+    const modelName = opts.model ?? creds.model ?? DEFAULT_MODELS[creds.provider];
+    const languageModel = getModel(creds, modelName);
+    const isJson = opts.outputFormat === "json";
+    const isSilent = opts.silent ?? false;
+    const transcript = buildCompactTranscript(prior.messages);
+
+    if (!isJson && !isSilent) startLoader("Compacting...");
+    const result = await generateText({
+      model: languageModel,
+      system: "You are a conversation summarizer. Produce a concise but information-dense summary of the prior assistant/user turns. Preserve decisions, file paths touched, code changes made, and open TODOs. Do not invent details. Reply with only the summary text.",
+      messages: [{ role: "user", content: `Summarize the following conversation:\n\n${transcript}` }],
+    });
+    if (!isJson && !isSilent) stopLoader();
+
+    const summaryText = result.text.trim();
+    if (summaryText) {
+      await saveSession({
+        ...prior,
+        messages: [
+          { role: "user", content: `Summary of prior conversation:\n${summaryText}` },
+          { role: "assistant", content: "Acknowledged. Continuing from this summary." },
+        ],
+        updatedAt: Date.now(),
+      });
+    }
+
+    if (isJson) {
+      emitJson({ type: "text", data: "Conversation compacted." });
+      emitJson({
+        type: "usage",
+        data: {
+          inputTokens: result.usage.inputTokens ?? 0,
+          outputTokens: result.usage.outputTokens ?? 0,
+          totalTokens: (result.usage.inputTokens ?? 0) + (result.usage.outputTokens ?? 0),
+          cumulativeInputTokens: result.usage.inputTokens ?? 0,
+          cumulativeOutputTokens: result.usage.outputTokens ?? 0,
+          cumulativeTotalTokens: (result.usage.inputTokens ?? 0) + (result.usage.outputTokens ?? 0),
+          sessionId: prior.id,
+          modelName,
+          provider: creds.provider,
+        },
+      });
+      emitJson({ type: "done" });
+    } else {
+      console.log("✓ Conversation compacted.");
+    }
+    return 0;
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
   const explicitModel = Boolean(opts.model || process.env.NLPILOT_MODEL);
   const shouldRouteModel = opts.modelRouting !== false && !explicitModel && !creds.baseUrl;
   const modelName = shouldRouteModel
@@ -78,12 +150,16 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   let priorMessages: Session["messages"] = [];
   let priorId: string | undefined;
   let priorCreatedAt: number | undefined;
+  let priorInputTokens = 0;
+  let priorOutputTokens = 0;
   if (opts.continueSession) {
     const prior = await loadMostRecentSession();
     if (prior) {
       priorMessages = prior.messages;
       priorId = prior.id;
       priorCreatedAt = prior.createdAt;
+      priorInputTokens = prior.cumulativeInputTokens ?? 0;
+      priorOutputTokens = prior.cumulativeOutputTokens ?? 0;
     }
   }
 
@@ -106,23 +182,49 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     hooks: customization.hooks,
     enableReasoningSummaries: opts.enableReasoningSummaries,
     additionalMcpConfig: opts.additionalMcpConfig,
-    cumulativeInputTokens: 0,
-    cumulativeOutputTokens: 0,
+    cumulativeInputTokens: priorInputTokens,
+    cumulativeOutputTokens: priorOutputTokens,
   };
 
   const approvals: ApprovalState = createApprovalState({
     autopilot: opts.allowAll,
     allow: opts.allow,
     deny: opts.deny,
-    nonInteractive: true, // no readline in one-shot
+    nonInteractive: !opts.interactiveApprovals,
+    silentPrompts: opts.outputFormat === "json",
   });
 
-  // Non-interactive prompt: any tool that would prompt gets denied unless pre-allowed.
-  const promptFn = async (): Promise<string> => "n";
+  let approvalReader: readline.Interface | undefined;
+  const promptFn = async (
+    _question: string,
+    request?: { toolName: string; summary: string; details?: string },
+  ): Promise<string> => {
+    if (!opts.interactiveApprovals || !request) return "n";
+
+    if (opts.outputFormat === "json") {
+      emitJson({
+        type: "approval-request",
+        data: {
+          id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+          toolName: request.toolName,
+          summary: request.summary,
+          details: request.details,
+        },
+      });
+    }
+
+    approvalReader ??= readline.createInterface({
+      input: process.stdin,
+      output: undefined,
+      terminal: false,
+    });
+    return await approvalReader.question("");
+  };
 
   const tools = buildTools({
     approvals,
     prompt: promptFn,
+    logToolCalls: opts.outputFormat !== "json" && opts.silent !== true,
     viewedFiles: new Set<string>(),
     editedFiles: new Set<string>(),
     recorder: {
@@ -211,8 +313,11 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
 
     if (!isJson) stdout.write("\n");
     session.lastAssistantText = assistantText;
-    const responseMessages = (await result.response).messages;
+    const [response, usage] = await Promise.all([result.response, result.totalUsage]);
+    const responseMessages = response.messages;
     session.messages.push(...responseMessages);
+    session.cumulativeInputTokens += usage.inputTokens ?? 0;
+    session.cumulativeOutputTokens += usage.outputTokens ?? 0;
 
     await saveSession({
       id: session.id,
@@ -222,15 +327,46 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
       createdAt: session.createdAt,
       updatedAt: Date.now(),
       messages: session.messages,
+      cumulativeInputTokens: session.cumulativeInputTokens,
+      cumulativeOutputTokens: session.cumulativeOutputTokens,
     });
 
+    if (isJson) {
+      const inputTokens = usage.inputTokens ?? 0;
+      const outputTokens = usage.outputTokens ?? 0;
+      const contextSize = getModelContextSize(creds.provider, modelName);
+      const cumulativeTotalTokens =
+        session.cumulativeInputTokens + session.cumulativeOutputTokens;
+      emitJson({
+        type: "usage",
+        data: {
+          inputTokens,
+          outputTokens,
+          totalTokens: inputTokens + outputTokens,
+          cumulativeInputTokens: session.cumulativeInputTokens,
+          cumulativeOutputTokens: session.cumulativeOutputTokens,
+          cumulativeTotalTokens,
+          contextSize,
+          contextPercentage: contextSize > 0
+            ? (cumulativeTotalTokens / contextSize) * 100
+            : undefined,
+          modelName,
+          provider: creds.provider,
+          sessionId: session.id,
+          isEstimate: false,
+        },
+      });
+    }
+
     if (isJson) emitJson({ type: "done" });
+    approvalReader?.close();
     await shutdownMcp();
     return 0;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (isJson) emitJson({ type: "error", data: { message } });
     else console.error("✗ Error:", message);
+    approvalReader?.close();
     await shutdownMcp();
     return 1;
   }

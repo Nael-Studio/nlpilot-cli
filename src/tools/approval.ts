@@ -11,17 +11,18 @@ export interface ApprovalState {
   denyList: Set<string>;
   /** When true, no interactive prompt is available; deny anything not pre-allowed. */
   nonInteractive: boolean;
+  /** Suppress human-readable approval prompt logs; useful for JSON transports. */
+  silentPrompts: boolean;
   /** Mutex to serialise concurrent approval prompts. */
   _promptLock: Promise<void>;
 }
-
-export type PromptFn = (question: string) => Promise<string>;
 
 export interface CreateApprovalOptions {
   autopilot?: boolean;
   allow?: string[];
   deny?: string[];
   nonInteractive?: boolean;
+  silentPrompts?: boolean;
 }
 
 export function createApprovalState(
@@ -33,6 +34,7 @@ export function createApprovalState(
     allowList: new Set(options.allow ?? []),
     denyList: new Set(options.deny ?? []),
     nonInteractive: options.nonInteractive ?? false,
+    silentPrompts: options.silentPrompts ?? false,
     _promptLock: Promise.resolve(),
   };
 }
@@ -42,6 +44,11 @@ export interface ApprovalRequest {
   summary: string;
   details?: string;
 }
+
+export type PromptFn = (
+  question: string,
+  request?: ApprovalRequest,
+) => Promise<string>;
 
 export async function requestApproval(
   state: ApprovalState,
@@ -66,12 +73,14 @@ export async function requestApproval(
     // Re-check fast-path after waiting (user may have pressed [!] for a prior call).
     if (state.alwaysAllow.has(req.toolName)) return "allow-session";
 
-    console.log();
-    console.log(kleur.yellow("⚠"), kleur.bold(`Tool request: ${req.toolName}`));
-    console.log(`  ${req.summary}`);
-    if (req.details) {
-      for (const line of req.details.split("\n")) {
-        console.log(kleur.dim(`  │ ${line}`));
+    if (!state.silentPrompts) {
+      console.log();
+      console.log(kleur.yellow("⚠"), kleur.bold(`Tool request: ${req.toolName}`));
+      console.log(`  ${req.summary}`);
+      if (req.details) {
+        for (const line of req.details.split("\n")) {
+          console.log(kleur.dim(`  │ ${line}`));
+        }
       }
     }
 
@@ -80,6 +89,7 @@ export async function requestApproval(
         kleur.cyan("Allow? ") +
           kleur.dim("[y]es / [!] always this session / [n]o ") +
           "› ",
+        req,
       )
     )
       .trim()

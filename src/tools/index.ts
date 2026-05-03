@@ -230,14 +230,16 @@ interface ToolDeps {
   approvals: ApprovalState;
   prompt: PromptFn;
   recorder: FileChangeRecorder;
+  logToolCalls?: boolean;
   /** Tracks which absolute paths have been viewed this turn. Reset between turns. */
   viewedFiles: Set<string>;
   /** Tracks which absolute paths were edited/created this turn (allows re-view after edit). */
   editedFiles: Set<string>;
 }
 
-function logToolCall(name: string, summary: string): void {
-  console.log(kleur.dim(`  ⚙ ${name}: ${summary}`));
+function logToolCall(enabled: boolean, name: string, summary: string): void {
+  if (!enabled) return;
+  process.stderr.write(`${kleur.dim(`  ⚙ ${name}: ${summary}`)}\n`);
 }
 
 const MAX_VIEW_LINES = 160; // max lines returned by the view tool per call
@@ -250,10 +252,11 @@ const MAX_VIEW_LINES = 160; // max lines returned by the view tool per call
  */
 export function buildTools(deps: ToolDeps): ToolSet {
   const { approvals, prompt, recorder, viewedFiles, editedFiles } = deps;
+  const logToolCalls = deps.logToolCalls ?? true;
 
   return {
     view: tool({
-      description: "Read file lines. Max 160 lines; avoid repeated reads.",
+      description: "Read file lines. Max 160 lines per call; use startLine/endLine to read additional sections when needed.",
       inputSchema: z.object({
         path: z.string(),
         startLine: z.number().int().min(1).optional().describe("1-based start"),
@@ -264,7 +267,7 @@ export function buildTools(deps: ToolDeps): ToolSet {
         try { abs = resolveInsideCwd(p); } catch (err) {
           return { error: err instanceof Error ? err.message : String(err) };
         }
-        logToolCall("view", `${p}${startLine != null ? ` L${startLine}-${endLine ?? "…"}` : ""}`);
+        logToolCall(logToolCalls, "view", `${p}${startLine != null ? ` L${startLine}-${endLine ?? "…"}` : ""}`);
         // Reject directory paths — use grep with filenamesOnly:true for listings.
         let stat: Awaited<ReturnType<typeof fs.stat>>;
         try { stat = await fs.stat(abs); } catch (err) {
@@ -272,12 +275,6 @@ export function buildTools(deps: ToolDeps): ToolSet {
         }
         if (stat.isDirectory()) {
           return { error: `"${p}" is a directory. Use grep with filenamesOnly:true to list its contents.` };
-        }
-        // Reject re-reads unless the file was edited this turn.
-        if (viewedFiles.has(abs) && !editedFiles.has(abs)) {
-          return {
-            error: `Already read "${p}" this turn. Use the content from the previous view result instead of re-reading.`,
-          };
         }
         viewedFiles.add(abs);
         let content: string;
@@ -460,7 +457,7 @@ export function buildTools(deps: ToolDeps): ToolSet {
         const base = process.cwd();
 
         if (filenamesOnly) {
-          logToolCall("grep/files", pattern);
+          logToolCall(logToolCalls, "grep/files", pattern);
           const g = new Glob(pattern);
           const results: string[] = [];
           for await (const file of g.scan({ cwd: base, onlyFiles: true })) {
@@ -470,7 +467,7 @@ export function buildTools(deps: ToolDeps): ToolSet {
           return { pattern, count: results.length, files: results };
         }
 
-        logToolCall("grep", `"${pattern}" in ${glob ?? "**/*"}`);
+        logToolCall(logToolCalls, "grep", `"${pattern}" in ${glob ?? "**/*"}`);
         const g = new Glob(glob ?? "**/*");
         let re: RegExp;
         try {

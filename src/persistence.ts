@@ -70,7 +70,7 @@ export async function listSessions(
   const files = await safeReaddir(dir);
   const out: PersistedSession[] = [];
   for (const f of files) {
-    if (!f.endsWith(".json")) continue;
+    if (!f.endsWith(".json") || f.endsWith(".display.json")) continue;
     try {
       out.push(JSON.parse(await readFile(join(dir, f), "utf8")) as PersistedSession);
     } catch {

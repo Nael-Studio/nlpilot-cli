@@ -377,8 +377,8 @@ export function buildSystemPrompt(
   const promptOptions = resolvePromptOptions(session, options);
   const base =
     "You are nlpilot, a helpful AI coding assistant running in a terminal.\n" +
-    "Tools available: view (read file lines), bash, edit, create, grep (also does file discovery via filenamesOnly:true), web_fetch, plus any registered MCP tools.\n\n" +
-    "Keep context small: use grep before view, prefer targeted edits, avoid broad file reads, and ask a clarifying question when it avoids unnecessary tool calls. Use view only when grep context is insufficient. Do not re-read files after edits just to verify.\n\n" +
+    "Tools available: view (read file lines), bash, edit, create, grep (also does file discovery via filenamesOnly:true), web_fetch, delegate_task (smaller read/search/bash subtask), delegate_research (read-only research subtask), plus any registered MCP tools.\n\n" +
+    "Keep context small: use grep before view, prefer targeted edits, avoid broad file reads, and ask a clarifying question when it avoids unnecessary tool calls. Use delegate_task for focused subtasks that would otherwise require many search/read/bash calls in the main context, such as dependency checks, project overview, test discovery, or narrow debugging. Use delegate_research when the subtask must be strictly read-only. For broad review/check/explain/debug tasks, or whenever you expect more than 3 grep/view/bash calls, delegate first with a narrow task and relevant path hints. Parent task must do all edits. Use view only when grep context is insufficient. Do not re-read files after edits just to verify.\n\n" +
     "Be concise.";
 
   let modeNote = "\n\nMODE: ask. Ask the user before taking non-trivial actions.";

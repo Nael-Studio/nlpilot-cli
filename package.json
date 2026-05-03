@@ -1,6 +1,6 @@
 {
   "name": "nlpilot",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "A CLI clone of GitHub Copilot CLI powered by the Vercel AI SDK",
   "type": "module",
   "bin": {

@@ -1,14 +1,17 @@
 import { stdout } from "node:process";
+import { readFile } from "node:fs/promises";
 import * as readline from "node:readline/promises";
-import { streamText, generateText, stepCountIs } from "ai";
+import { streamText, generateText, stepCountIs, tool } from "ai";
+import { z } from "zod";
 import { resolveCredentials, DEFAULT_MODELS } from "../config.ts";
 import { getModel } from "../providers.ts";
 import { resolveRoutedModel } from "../model-router.ts";
-import { getModelContextSize } from "../models.ts";
+import { getModelContextSize, listModels } from "../models.ts";
 import { buildTools } from "../tools/index.ts";
 import {
   createApprovalState,
   type ApprovalState,
+  type PromptFn,
 } from "../tools/approval.ts";
 import {
   buildSystemPrompt,
@@ -45,6 +48,13 @@ export interface OneShotOptions {
   mcp?: boolean;
   modelRouting?: boolean;
   interactiveApprovals?: boolean;
+  imageContextFile?: string;
+}
+
+interface ImageAttachment {
+  name: string;
+  mediaType: string;
+  dataUrl: string;
 }
 
 interface JsonEvent {
@@ -62,6 +72,149 @@ interface JsonEvent {
 
 function emitJson(event: JsonEvent): void {
   process.stdout.write(JSON.stringify(event) + "\n");
+}
+
+async function loadImageAttachments(path: string | undefined): Promise<ImageAttachment[]> {
+  if (!path) return [];
+  const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+  if (!Array.isArray(parsed)) return [];
+  return parsed.flatMap((item): ImageAttachment[] => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Record<string, unknown>;
+    if (
+      typeof record.name !== "string" ||
+      typeof record.mediaType !== "string" ||
+      typeof record.dataUrl !== "string" ||
+      !record.mediaType.startsWith("image/") ||
+      !record.dataUrl.startsWith("data:image/")
+    ) {
+      return [];
+    }
+    return [{ name: record.name, mediaType: record.mediaType, dataUrl: record.dataUrl }];
+  });
+}
+
+function chooseSubtaskModel(provider: Session["creds"]["provider"], currentModel: string): string {
+  const models = listModels(provider);
+  if (models.length === 0) return currentModel;
+
+  const preferred = [
+    "nano",
+    "haiku",
+    "flash-lite",
+    "flash",
+    "mini",
+  ];
+  for (const marker of preferred) {
+    const model = models.find((m) =>
+      m.id.toLowerCase().includes(marker) ||
+      m.label.toLowerCase().includes(marker) ||
+      m.description?.toLowerCase().includes(marker),
+    );
+    if (model) return model.id;
+  }
+
+  return models.at(-1)?.id ?? currentModel;
+}
+
+function shouldAutoDelegateSubtask(prompt: string): boolean {
+  const lower = prompt.toLowerCase().replaceAll(/\s+/g, " ").trim();
+  return (
+    /\b(?:what is|what's|explain|summari[sz]e|overview|understand|tell me)\b.*\b(?:project|repo|repository|codebase|app)\b/.test(lower) ||
+    /\b(?:project|repo|repository|codebase|app)\b.*\b(?:doing|overview|structure|work|built|about)\b/.test(lower) ||
+    /\b(?:outdated|out of date|newer versions?|package updates?|dependencies|dependency updates?)\b/.test(lower)
+  );
+}
+
+function autoSubtask(prompt: string): { task: string; context: string[]; allowBash: boolean } {
+  const lower = prompt.toLowerCase();
+  if (/\b(?:outdated|out of date|newer versions?|package updates?|dependencies|dependency updates?)\b/.test(lower)) {
+    return {
+      task: [
+        "Check which project dependencies are outdated and summarize the result.",
+        "Inspect package manager metadata first, then run the appropriate non-mutating outdated/check command if needed.",
+        "Do not modify files or install packages.",
+        `User request: ${prompt}`,
+      ].join(" "),
+      context: ["package.json", "bun.lock", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
+      allowBash: true,
+    };
+  }
+
+  return {
+    task: [
+      "Inspect the project at a high level and summarize what it does.",
+      "Focus on package metadata, README/docs, app entry points, routes, and major source folders.",
+      `User request: ${prompt}`,
+    ].join(" "),
+    context: ["package.json", "README.md", "src/"],
+    allowBash: false,
+  };
+}
+
+async function runDelegatedSubtask(args: {
+  creds: Session["creds"];
+  parentModelName: string;
+  task: string;
+  context?: string[];
+  model?: string;
+  allowBash?: boolean;
+  approvals: ApprovalState;
+  prompt: PromptFn;
+}): Promise<{
+  task: string;
+  modelName: string;
+  summary: string;
+  usage: { inputTokens: number; outputTokens: number; totalTokens: number };
+}> {
+  const subtaskModel = args.model ??
+    (args.creds.baseUrl ? args.parentModelName : chooseSubtaskModel(args.creds.provider, args.parentModelName));
+  const subTools = buildTools({
+    approvals: args.allowBash
+      ? args.approvals
+      : createApprovalState({ autopilot: true, nonInteractive: true, silentPrompts: true }),
+    prompt: args.allowBash ? args.prompt : async () => "n",
+    logToolCalls: false,
+    viewedFiles: new Set<string>(),
+    editedFiles: new Set<string>(),
+    recorder: { record: () => undefined },
+  });
+  if (!args.allowBash) delete subTools.bash;
+  delete subTools.edit;
+  delete subTools.create;
+  delete subTools.delegate_research;
+  delete subTools.delegate_task;
+
+  const contextText = args.context?.length
+    ? `\n\nFocus context:\n${args.context.map((item) => `- ${item}`).join("\n")}`
+    : "";
+  const result = await generateText({
+    model: getModel(args.creds, subtaskModel),
+    system:
+      "You are a delegated subtask agent for nlpilot. Do not modify files, install packages, or make final code changes. Use read/search/fetch tools, and use bash only for non-mutating inspection commands when available. Return a concise structured summary for the parent agent with: commands run, files inspected, key findings, risks, and recommended next steps. Include exact file paths and line ranges when relevant.",
+    messages: [
+      {
+        role: "user",
+        content: `Delegated task:\n${args.task}${contextText}`,
+      },
+    ],
+    tools: subTools,
+    stopWhen: stepCountIs(12),
+    maxOutputTokens: 1_500,
+  });
+
+  const inputTokens = result.usage.inputTokens ?? 0;
+  const outputTokens = result.usage.outputTokens ?? 0;
+  return {
+    task: args.task,
+    modelName: subtaskModel,
+    summary: result.text.trim(),
+    usage: {
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+    },
+  };
 }
 
 export async function runOneShot(opts: OneShotOptions): Promise<number> {
@@ -238,6 +391,51 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     },
   });
 
+  tools.delegate_research = tool({
+    description:
+      "Spawn an isolated read-only research subtask to inspect files or gather focused context. Use this when the main task would otherwise need many grep/view calls. The subtask cannot edit files or run shell commands.",
+    inputSchema: z.object({
+      task: z.string().min(1).describe("Specific research question for the subtask."),
+      context: z.array(z.string()).max(20).optional().describe("Relevant files, folders, symbols, or constraints to focus the subtask."),
+      model: z.string().optional().describe("Optional cheaper model override for this research subtask."),
+    }),
+    execute: async ({ task, context, model }) => {
+      return await runDelegatedSubtask({
+        creds,
+        parentModelName: modelName,
+        task,
+        context,
+        model,
+        allowBash: false,
+        approvals,
+        prompt: promptFn,
+      });
+    },
+  });
+
+  tools.delegate_task = tool({
+    description:
+      "Spawn an isolated subtask for a smaller investigation. It can read/search/fetch and may run non-mutating bash commands such as dependency checks or test discovery, but it cannot edit or create files.",
+    inputSchema: z.object({
+      task: z.string().min(1).describe("Specific subtask for the delegated agent."),
+      context: z.array(z.string()).max(20).optional().describe("Relevant files, folders, commands, or constraints to focus the subtask."),
+      allowBash: z.boolean().optional().describe("Allow non-mutating bash commands inside the subtask when needed."),
+      model: z.string().optional().describe("Optional cheaper model override for this subtask."),
+    }),
+    execute: async ({ task, context, allowBash, model }) => {
+      return await runDelegatedSubtask({
+        creds,
+        parentModelName: modelName,
+        task,
+        context,
+        model,
+        allowBash: Boolean(allowBash),
+        approvals,
+        prompt: promptFn,
+      });
+    },
+  });
+
   let shutdownMcp = async (): Promise<void> => undefined;
   if (opts.mcp !== false) {
     // Bring up MCP runtime (global + project .mcp.json + additional) and merge its tools.
@@ -252,18 +450,65 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
   }
 
   session.turn += 1;
-  session.messages.push({ role: "user", content: opts.prompt });
 
   const isJson = opts.outputFormat === "json";
   const isSilent = opts.silent ?? false;
 
   try {
+    let userPrompt = opts.prompt;
+    const imageAttachments = await loadImageAttachments(opts.imageContextFile);
+    if (shouldAutoDelegateSubtask(opts.prompt)) {
+      const subtaskInput = autoSubtask(opts.prompt);
+      if (isJson) {
+        emitJson({
+          type: "tool-call",
+          data: { toolName: "delegate_task", input: subtaskInput },
+        });
+      } else if (!isSilent) {
+        process.stderr.write("\n  -> delegate_task\n");
+      }
+
+      const subtaskResult = await runDelegatedSubtask({
+        creds,
+        parentModelName: modelName,
+        task: subtaskInput.task,
+        context: subtaskInput.context,
+        allowBash: subtaskInput.allowBash,
+        approvals,
+        prompt: promptFn,
+      });
+
+      if (isJson) {
+        emitJson({
+          type: "tool-result",
+          data: { toolName: "delegate_task", output: subtaskResult },
+        });
+      }
+
+      userPrompt +=
+        "\n\n--- Delegated subtask summary ---\n" +
+        `Model: ${subtaskResult.modelName}\n` +
+        subtaskResult.summary;
+    }
+
+    const userMessageContent = imageAttachments.length > 0
+      ? [
+          { type: "text" as const, text: userPrompt },
+          ...imageAttachments.map((image) => ({
+            type: "image" as const,
+            image: image.dataUrl,
+            mediaType: image.mediaType,
+          })),
+        ]
+      : userPrompt;
+    session.messages.push({ role: "user", content: userMessageContent });
+
     if (!isJson && !isSilent) {
       startLoader("Thinking...");
     }
     const result = streamText({
       model: session.languageModel,
-      system: buildSystemPrompt(session, { latestUserMessage: opts.prompt }),
+      system: buildSystemPrompt(session, { latestUserMessage: userPrompt }),
       messages: trimMessagesForSending(session.messages),
       tools,
       stopWhen: stepCountIs(opts.maxSteps ?? 100),
@@ -315,6 +560,13 @@ export async function runOneShot(opts: OneShotOptions): Promise<number> {
     session.lastAssistantText = assistantText;
     const [response, usage] = await Promise.all([result.response, result.totalUsage]);
     const responseMessages = response.messages;
+    if (imageAttachments.length > 0) {
+      const lastUser = session.messages.findLast((message) => message.role === "user");
+      if (lastUser) {
+        lastUser.content =
+          `${userPrompt}\n\n[${imageAttachments.length} image attachment${imageAttachments.length === 1 ? "" : "s"} omitted from saved session.]`;
+      }
+    }
     session.messages.push(...responseMessages);
     session.cumulativeInputTokens += usage.inputTokens ?? 0;
     session.cumulativeOutputTokens += usage.outputTokens ?? 0;

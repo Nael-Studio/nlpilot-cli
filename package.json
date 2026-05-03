@@ -1,16 +1,24 @@
 {
-  "name": "nlpilot",
+  "name": "@naelstudio/nlpilot",
   "version": "0.0.1",
   "description": "A CLI clone of GitHub Copilot CLI powered by the Vercel AI SDK",
   "type": "module",
   "bin": {
-    "nlpilot": "./src/index.ts"
+    "nlpilot": "./dist/nlpilot.js"
   },
+  "files": [
+    "dist",
+    "models.json",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run src/index.ts",
     "build": "bun build src/index.ts --target=bun --outfile=dist/nlpilot.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "pack:dry": "npm pack --dry-run",
+    "publish:npm": "bun run scripts/publish-npm.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

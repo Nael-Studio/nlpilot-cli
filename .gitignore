@@ -6,3 +6,4 @@ dist/
 .env.*
 !.env.example
 .nlpilot/
+scripts/publish-npm.sh

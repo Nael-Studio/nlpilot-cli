@@ -72,7 +72,7 @@ The API key and base URL are stored together in the credentials file. When a `ba
 | Variable | Description |
 |---|---|
 | `NLPILOT_API_KEY` | Override stored API key |
-| `NLPILOT_PROVIDER` | Override stored provider |
+| `NLPILOT_PROVIDER` | Override stored provider (`openai`, `anthropic`, `google`, `deepseek`, `moonshotai`) |
 | `NLPILOT_MODEL` | Override stored model for this run |
 
 ---

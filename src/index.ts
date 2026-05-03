@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 import { Command, InvalidArgumentError, Option } from "commander";
 import kleur from "kleur";
 import pkg from "../package.json" with { type: "json" };

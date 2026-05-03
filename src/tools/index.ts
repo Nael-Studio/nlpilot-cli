@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import { isIP } from "node:net";
 import * as path from "node:path";
 import kleur from "kleur";
-import { Glob } from "bun";
+import { scanFiles } from "../fs-glob.ts";
 import {
   requestApproval,
   type ApprovalState,
@@ -458,9 +458,8 @@ export function buildTools(deps: ToolDeps): ToolSet {
 
         if (filenamesOnly) {
           logToolCall(logToolCalls, "grep/files", pattern);
-          const g = new Glob(pattern);
           const results: string[] = [];
-          for await (const file of g.scan({ cwd: base, onlyFiles: true })) {
+          for await (const file of scanFiles(pattern, base)) {
             results.push(file);
             if (results.length >= 200) break;
           }
@@ -468,7 +467,6 @@ export function buildTools(deps: ToolDeps): ToolSet {
         }
 
         logToolCall(logToolCalls, "grep", `"${pattern}" in ${glob ?? "**/*"}`);
-        const g = new Glob(glob ?? "**/*");
         let re: RegExp;
         try {
           const flags = ignoreCase ? "i" : "";
@@ -486,7 +484,7 @@ export function buildTools(deps: ToolDeps): ToolSet {
           context?: string[];
         }> = [];
         let totalChars = 0;
-        outer: for await (const file of g.scan({ cwd: base, onlyFiles: true })) {
+        outer: for await (const file of scanFiles(glob ?? "**/*", base)) {
           let content: string;
           try {
             content = await fs.readFile(path.join(base, file), "utf8");

@@ -3,7 +3,6 @@ import { stdin, stdout } from "node:process";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve as pathResolve } from "node:path";
-import { Glob } from "bun";
 import { streamText, stepCountIs } from "ai";
 import kleur from "kleur";
 import { resolveCredentials, DEFAULT_MODELS } from "../config.ts";
@@ -11,6 +10,7 @@ import { getModel, PROVIDER_LABELS } from "../providers.ts";
 import { getModelContextSize } from "../models.ts";
 import { resolveRoutedModel } from "../model-router.ts";
 import { buildTools } from "../tools/index.ts";
+import { scanFiles } from "../fs-glob.ts";
 import { createApprovalState } from "../tools/approval.ts";
 import {
   buildSystemPrompt,
@@ -262,9 +262,8 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
   // Pre-scan a compact source-file snapshot. Keep it intentionally small:
   // this text is sent on every REPL turn, so a complete tree becomes a token tax.
   try {
-    const g = new Glob("**/*.{ts,tsx,js,jsx,mjs,mts,json,md}");
     const files: string[] = [];
-    for await (const f of g.scan({ cwd: process.cwd(), onlyFiles: true })) {
+    for await (const f of scanFiles("**/*.{ts,tsx,js,jsx,mjs,mts,json,md}", process.cwd())) {
       if (!f.includes("node_modules") && !f.includes(".git") && !f.startsWith("dist/")) {
         files.push(f);
         if (files.length >= SOURCE_SCAN_LIMIT) break;

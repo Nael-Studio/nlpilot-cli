@@ -8,6 +8,12 @@ import * as path from "node:path";
 import kleur from "kleur";
 import { scanFiles } from "../fs-glob.ts";
 import {
+  getFffFinder,
+  makeFffGrepQuery,
+  mapFffMatch,
+  mapFffMode,
+} from "../search/fff.ts";
+import {
   requestApproval,
   type ApprovalState,
   type PromptFn,
@@ -20,6 +26,7 @@ export interface FileChangeRecorder {
 
 const MAX_OUTPUT = 4_000;   // bash stdout/stderr cap per call
 const MAX_GREP_OUTPUT = 8_000; // total chars across all grep matches
+const MAX_GREP_MATCHES = 200;
 const WEB_FETCH_MAX_BYTES = 100_000;
 const WEB_FETCH_TIMEOUT_MS = 15_000;
 const WEB_FETCH_MAX_REDIRECTS = 5;
@@ -328,6 +335,7 @@ export function buildTools(deps: ToolDeps): ToolSet {
           { re: /^tail\s/, alt: "the view tool with startLine/endLine" },
           { re: /^wc\s/, alt: "the view tool (check totalLines in response)" },
           { re: /^grep\s/, alt: "the grep tool" },
+          { re: /^rg(\s|$)/, alt: "the grep tool" },
           { re: /^sed\s+-n\s+['"]?\d/, alt: "the view tool with startLine/endLine" },
           { re: /^glob\s/, alt: "grep with filenamesOnly:true" },
         ];
@@ -455,18 +463,97 @@ export function buildTools(deps: ToolDeps): ToolSet {
       }),
       execute: async ({ pattern, glob, regex, ignoreCase, contextLines, filenamesOnly }) => {
         const base = process.cwd();
+        const requestedBackend = (process.env.NLPILOT_SEARCH_BACKEND ?? "fff").toLowerCase();
+        const allowFff = requestedBackend !== "native";
 
         if (filenamesOnly) {
-          logToolCall(logToolCalls, "grep/files", pattern);
+          if (allowFff) {
+            const fff = await getFffFinder(base);
+            if (fff.ok) {
+              const result = fff.finder.fileSearch(pattern, { pageSize: MAX_GREP_MATCHES });
+              if (result.ok) {
+                logToolCall(logToolCalls, "grep/files/fff", pattern);
+                const files = result.value.items
+                  .slice(0, MAX_GREP_MATCHES)
+                  .map((item) => item.relativePath);
+                return {
+                  pattern,
+                  count: files.length,
+                  totalMatched: result.value.totalMatched,
+                  totalFiles: result.value.totalFiles,
+                  files,
+                  backend: "fff",
+                };
+              }
+            }
+          }
+
+          logToolCall(logToolCalls, "grep/files/native", pattern);
           const results: string[] = [];
           for await (const file of scanFiles(pattern, base)) {
             results.push(file);
-            if (results.length >= 200) break;
+            if (results.length >= MAX_GREP_MATCHES) break;
           }
-          return { pattern, count: results.length, files: results };
+          return { pattern, count: results.length, files: results, backend: "native" };
         }
 
-        logToolCall(logToolCalls, "grep", `"${pattern}" in ${glob ?? "**/*"}`);
+        const ctx = contextLines ?? 0;
+
+        if (allowFff && !ignoreCase) {
+          const fff = await getFffFinder(base);
+          if (fff.ok) {
+            const query = makeFffGrepQuery(pattern, glob);
+            const result = fff.finder.grep(query, {
+              mode: mapFffMode(regex),
+              smartCase: false,
+              beforeContext: ctx,
+              afterContext: ctx,
+              maxMatchesPerFile: MAX_GREP_MATCHES,
+              timeBudgetMs: 500,
+            });
+            if (result.ok) {
+              logToolCall(logToolCalls, "grep/fff", `"${pattern}" in ${glob ?? "**/*"}`);
+              const matches: Array<{
+                file: string;
+                line: number;
+                text: string;
+                context?: string[];
+              }> = [];
+              let totalChars = 0;
+
+              for (const match of result.value.items) {
+                const entry = mapFffMatch(match, ctx);
+                matches.push(entry);
+                totalChars += entry.text.length + (entry.context?.join("").length ?? 0);
+                if (matches.length >= MAX_GREP_MATCHES || totalChars >= MAX_GREP_OUTPUT) break;
+              }
+
+              const truncatedBySize = totalChars >= MAX_GREP_OUTPUT;
+              return {
+                pattern,
+                count: matches.length,
+                totalMatched: result.value.totalMatched,
+                totalFilesSearched: result.value.totalFilesSearched,
+                totalFiles: result.value.totalFiles,
+                filteredFileCount: result.value.filteredFileCount,
+                matches,
+                backend: "fff",
+                ...(result.value.regexFallbackError
+                  ? { regexFallbackError: result.value.regexFallbackError }
+                  : undefined),
+                ...(truncatedBySize
+                  ? { note: `Output cap reached (${MAX_GREP_OUTPUT} chars). Results are partial — use a more specific pattern or glob.` }
+                  : matches.length >= MAX_GREP_MATCHES || result.value.nextCursor
+                    ? { note: `Match cap reached (${MAX_GREP_MATCHES}). Consider a more specific pattern or glob.` }
+                    : matches.length > 50
+                      ? { note: `Large result set (${matches.length} matches). Consider a more specific pattern or glob.` }
+                      : undefined),
+              };
+            }
+          }
+        }
+
+        logToolCall(logToolCalls, "grep/native", `"${pattern}" in ${glob ?? "**/*"}`);
         let re: RegExp;
         try {
           const flags = ignoreCase ? "i" : "";
@@ -476,7 +563,6 @@ export function buildTools(deps: ToolDeps): ToolSet {
         } catch (err) {
           return { error: err instanceof Error ? err.message : String(err) };
         }
-        const ctx = contextLines ?? 0;
         const matches: Array<{
           file: string;
           line: number;
@@ -509,7 +595,7 @@ export function buildTools(deps: ToolDeps): ToolSet {
               }
               matches.push(entry);
               totalChars += entry.text.length + (entry.context?.join("").length ?? 0);
-              if (matches.length >= 200 || totalChars >= MAX_GREP_OUTPUT) break outer;
+              if (matches.length >= MAX_GREP_MATCHES || totalChars >= MAX_GREP_OUTPUT) break outer;
             }
           }
         }
@@ -518,10 +604,11 @@ export function buildTools(deps: ToolDeps): ToolSet {
           pattern,
           count: matches.length,
           matches,
+          backend: "native",
           ...(truncatedBySize
             ? { note: `Output cap reached (${MAX_GREP_OUTPUT} chars). Results are partial — use a more specific pattern or glob.` }
-            : matches.length >= 200
-              ? { note: `Match cap reached (200). Consider a more specific pattern or glob.` }
+            : matches.length >= MAX_GREP_MATCHES
+              ? { note: `Match cap reached (${MAX_GREP_MATCHES}). Consider a more specific pattern or glob.` }
               : matches.length > 50
                 ? { note: `Large result set (${matches.length} matches). Consider a more specific pattern or glob.` }
                 : undefined),

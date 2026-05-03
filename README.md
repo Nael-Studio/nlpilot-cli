@@ -1,6 +1,17 @@
 # nlpilot CLI
 
-A GitHub Copilot-style AI coding assistant for the terminal, powered by the [Vercel AI SDK](https://sdk.vercel.ai). Supports OpenAI, Anthropic, Google, and any custom endpoint (including Azure AI Foundry).
+A GitHub Copilot-style AI coding assistant for the terminal, powered by the [Vercel AI SDK](https://sdk.vercel.ai). Supports OpenAI, Anthropic, Google, DeepSeek, Moonshot AI/Kimi, and custom OpenAI-compatible endpoints.
+
+nlpilot is built for developers who want the Copilot workflow without being locked into one billing model or one model catalog. GitHub Copilot is moving from request-based billing to usage-based GitHub AI Credits on June 1, 2026, where chat and agent usage are priced by token consumption per model. nlpilot lets you bring your own API keys, choose smaller or cheaper models for routine work, and still keep familiar chat, tool use, sessions, code edits, and model switching.
+
+Useful cost-focused model choices include:
+
+- `kimi-k2.6` through Moonshot AI for agentic coding and long-context work
+- `deepseek-v4-flash` for fast, low-cost everyday coding
+- `deepseek-v4-pro` for harder reasoning and larger codebase analysis
+- `claude-3-haiku`, Gemini Flash/Lite, and mini/nano models for low-latency tasks
+
+References: [GitHub Copilot models and pricing](https://docs.github.com/copilot/reference/copilot-billing/models-and-pricing), [GitHub usage-based billing](https://docs.github.com/copilot/concepts/billing/usage-based-billing-for-individuals), [Kimi model list](https://platform.kimi.ai/docs/models), and [DeepSeek V4 Pro API reference](https://docs.api.nvidia.com/nim/reference/deepseek-ai-deepseek-v4-pro).
 
 ---
 
@@ -32,29 +43,29 @@ After linking, the `nlpilot` command is available system-wide.
 
 ## Authentication
 
-### Standard providers (OpenAI / Anthropic / Google)
+### Standard providers
 
 ```bash
 nlpilot login
 ```
 
 The interactive wizard will ask you to:
-1. Select a provider (`openai`, `anthropic`, or `google`)
+1. Select a provider (`openai`, `anthropic`, `google`, `deepseek`, or `moonshotai`)
 2. Enter your API key (hidden input)
-3. Optionally enter a custom endpoint base URL (see Azure Foundry below)
+3. Optionally enter a custom endpoint base URL
 4. Pick a default model from the curated catalog, or enter a custom model ID
 
 Credentials are saved to `~/.nlpilot/credentials` with `0600` permissions.
 
-### Azure AI Foundry (custom endpoint)
+### Custom endpoint
 
-When prompted "Use custom endpoint?", choose **Yes** and enter your Foundry endpoint, e.g.:
+When prompted "Use custom endpoint?", choose **Yes** and enter an OpenAI-compatible endpoint, e.g.:
 
 ```
 https://<your-instance>.services.ai.azure.com/anthropic/v1
 ```
 
-The API key and base URL are stored together in the credentials file. When a `baseUrl` is present the `@ai-sdk/anthropic` provider is used directly (bypassing the AI Gateway).
+The API key and base URL are stored together in the credentials file. When a `baseUrl` is present, nlpilot calls the provider SDK directly instead of routing through the AI Gateway. Anthropic custom endpoints use `@ai-sdk/anthropic`; other custom endpoints use the OpenAI-compatible client.
 
 ### Environment variable overrides
 
@@ -147,6 +158,11 @@ The agent has access to these built-in tools. Each tool that modifies the filesy
 | `create` | Create a new file (tracks changes for `/undo`) |
 | `grep` | Search file contents, or list files with `filenamesOnly:true` |
 | `web_fetch` | Fetch public HTTP/HTTPS URLs with approval and SSRF protections |
+
+`grep` uses the FFF search backend when the native library is available, keeping
+an indexed cache warm across repeated searches in the same CLI process. If FFF
+is unavailable, or if `NLPILOT_SEARCH_BACKEND=native` is set, nlpilot falls back
+to its built-in TypeScript scanner.
 
 ---
 
@@ -341,8 +357,8 @@ Create or edit `~/.nlpilot/models.json` to customize available models:
       "name": "Claude Sonnet 4.6",
       "description": "Balanced flagship model",
       "contextSize": 1000000,
-      "inputCost": 0.003,
-      "outputCost": 0.015
+      "inputCost": 3.00,
+      "outputCost": 15.00
     }
   ],
   "openai": [
@@ -351,8 +367,8 @@ Create or edit `~/.nlpilot/models.json` to customize available models:
       "name": "GPT-5.4",
       "description": "Balanced model",
       "contextSize": 1100000,
-      "inputCost": 0.005,
-      "outputCost": 0.020
+      "inputCost": 2.50,
+      "outputCost": 15.00
     }
   ],
   "google": [
@@ -361,8 +377,36 @@ Create or edit `~/.nlpilot/models.json` to customize available models:
       "name": "Gemini 2.5 Pro",
       "description": "Advanced reasoning model",
       "contextSize": 1000000,
-      "inputCost": 0.0025,
-      "outputCost": 0.01
+      "inputCost": 2.50,
+      "outputCost": 10.00
+    }
+  ],
+  "deepseek": [
+    {
+      "id": "deepseek-v4-pro",
+      "name": "DeepSeek V4 Pro",
+      "description": "Advanced reasoning and agentic coding",
+      "contextSize": 1000000,
+      "inputCost": 1.74,
+      "outputCost": 3.48
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "name": "DeepSeek V4 Flash",
+      "description": "Fast economical coding model",
+      "contextSize": 1000000,
+      "inputCost": 0.14,
+      "outputCost": 0.28
+    }
+  ],
+  "moonshotai": [
+    {
+      "id": "kimi-k2.6",
+      "name": "Kimi K2.6",
+      "description": "Agentic coding and multimodal long-context work",
+      "contextSize": 256000,
+      "inputCost": 0.95,
+      "outputCost": 4.00
     }
   ]
 }
@@ -429,6 +473,19 @@ When no explicit model is provided, nlpilot classifies each prompt and routes to
 | `gemini-2.5-pro` | Flagship reasoning |
 | `gemini-2.5-flash` | Fast multimodal |
 | `gemini-2.5-flash-lite` | Most affordable |
+
+### DeepSeek
+| Model ID | Description |
+|---|---|
+| `deepseek-v4-pro` | Advanced reasoning and agentic coding · 1M ctx |
+| `deepseek-v4-flash` | Fast economical coding · 1M ctx |
+| `deepseek-v3.2` | Previous generation |
+| `deepseek-v3.2-thinking` | Previous generation with extended thinking |
+
+### Moonshot AI / Kimi
+| Model ID | Description |
+|---|---|
+| `kimi-k2.6` | Agentic coding, visual/text input, thinking and non-thinking modes · 256K ctx |
 
 Any model ID not in the catalog can be entered as a custom ID during `nlpilot login` or by passing `--model <id>`.
 
